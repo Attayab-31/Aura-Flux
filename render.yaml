@@ -1,0 +1,38 @@
+services:
+  - type: web
+    name: fluxstory
+    runtime: docker
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /healthz
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
+      - key: SESSION_COOKIE_SECURE
+        value: "true"
+      - key: FLASK_DEBUG
+        value: "false"
+      - key: SUPABASE_DB_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SUPABASE_STORAGE_BUCKET
+        value: fluxstory-media
+      - key: KAGGLE_BATCH_AUTOSTART
+        value: "false"
+      - key: KAGGLE_API_TOKEN
+        sync: false
+      - key: KAGGLE_KERNEL_ID
+        sync: false
+      - key: WORKER_CALLBACK_TOKEN
+        sync: false
+      - key: DEEPGRAM_API_KEY
+        sync: false
+      - key: LLM_PROVIDER
+        value: gemini
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: DEFAULT_LLM_MODEL
+        value: gemini-2.5-flash

@@ -1,0 +1,350 @@
+{% extends "base.html" %}
+
+{% block title %}Create a video — AuraFLUX Studio{% endblock %}
+{% block breadcrumb %}Create video{% endblock %}
+{% block content %}
+<div class="space-y-8">
+
+    <!-- Hero / Headline Section -->
+    <div class="relative rounded-2xl bg-gradient-to-r from-surface-900 via-surface-850 to-surface-900 border border-slate-800/80 p-6 sm:p-8 overflow-hidden shadow-2xl">
+        <div class="absolute -right-16 -top-16 w-64 h-64 bg-brand-500/10 rounded-full blur-3xl pointer-events-none"></div>
+        <div class="absolute -left-16 -bottom-16 w-64 h-64 bg-cyan-500/10 rounded-full blur-3xl pointer-events-none"></div>
+
+        <div class="relative z-10 max-w-3xl">
+            <div class="inline-flex items-center space-x-2 px-3 py-1 rounded-full bg-brand-500/10 border border-brand-500/20 text-brand-400 text-xs font-medium mb-3">
+                <i class="fa-solid fa-sparkles"></i>
+                <span>From script to finished video</span>
+            </div>
+            <h1 class="text-2xl sm:text-4xl font-extrabold tracking-tight text-white mb-2">
+                Turn a script into a finished video
+            </h1>
+            <p class="text-slate-400 text-sm sm:text-base leading-relaxed">
+                Shape your story, choose a format and voice, then follow each production stage as your video comes together.
+            </p>
+        </div>
+    </div>
+
+    <!-- Main Creation Grid -->
+    <div class="grid grid-cols-1 lg:grid-cols-12 gap-8">
+
+        <!-- Left Column: Storyboard & Video Specification Form (7 Cols) -->
+        <div class="lg:col-span-7 space-y-6">
+            <form id="video-creation-form" class="space-y-6">
+
+                <!-- Narrative Script Card -->
+                <div class="bg-surface-900/90 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-4">
+                    <div class="flex items-center justify-between">
+                        <label for="story_text" class="text-sm font-semibold text-slate-200 flex items-center space-x-2">
+                            <i class="fa-solid fa-feather-pointed text-brand-400"></i>
+                            <span>Script</span>
+                        </label>
+                        <!-- Quick Sample Inserters -->
+                        <div class="dropdown relative inline-block text-left">
+                            <button type="button" id="sample-btn" class="text-xs text-brand-400 hover:text-brand-300 font-medium flex items-center space-x-1 px-2.5 py-1 rounded-lg bg-brand-500/10 border border-brand-500/20 transition">
+                                <i class="fa-solid fa-wand-magic-sparkles"></i>
+                                <span>Load Sample Script</span>
+                            </button>
+                        </div>
+                    </div>
+
+                    <textarea
+                        id="story_text"
+                        name="story_text"
+                        rows="6"
+                        required
+                                placeholder="Write or paste the narration you want to turn into a video."
+                        class="w-full bg-surface-950 border border-slate-800 focus:border-brand-500 focus:ring-1 focus:ring-brand-500 rounded-xl p-4 text-slate-100 placeholder-slate-500 text-sm leading-relaxed transition resize-y"
+                    ></textarea>
+
+                    <div class="flex items-center justify-between text-xs text-slate-500">
+                        <span id="char-count">0 characters &bull; 0 words</span>
+                        <span>Narration is divided across the image count you choose</span>
+                    </div>
+                </div>
+
+                <!-- Timing & Format Configurations -->
+                <div class="bg-surface-900/90 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-5">
+                    <h3 class="text-sm font-semibold text-slate-200 flex items-center space-x-2">
+                        <i class="fa-solid fa-sliders text-cyan-400"></i>
+                        <span>Video Specifications & Pacing</span>
+                    </h3>
+
+                    <!-- Target Duration Slider -->
+                    <div class="space-y-2">
+                        <div class="flex justify-between items-center text-sm">
+                            <label for="duration_minutes" class="text-slate-300 font-medium">Target Duration</label>
+                            <span class="font-mono text-cyan-400 font-bold px-2 py-0.5 rounded bg-cyan-500/10 border border-cyan-500/20" id="duration-display">
+                                0.70 mins (~42 sec)
+                            </span>
+                        </div>
+                        <input
+                            type="range"
+                            id="duration_minutes"
+                            name="duration_minutes"
+                            min="0.3"
+                            max="3.0"
+                            step="0.1"
+                            value="0.7"
+                            class="w-full h-2 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-cyan-400"
+                        >
+                        <div class="flex justify-between text-[11px] text-slate-500">
+                            <span>0.3m (Short clip, ~3 scenes)</span>
+                            <span id="estimated-scenes-label">Suggested: 6 images</span>
+                            <span>3.0m (Narrative epic, ~25 scenes)</span>
+                        </div>
+                    </div>
+
+                    <!-- Explicit image / scene count -->
+                    <div class="image-count-control" aria-labelledby="image-count-heading">
+                        <div class="image-count-heading-row">
+                            <div>
+                                <label id="image-count-heading" for="image_count_range">Images in this video</label>
+                                <p id="image-count-description">Each image becomes one scene. Total video duration stays the same.</p>
+                            </div>
+                            <div class="image-count-value-group">
+                                <output id="image-count-value" for="image_count_range image_count">6 images</output>
+                                <button type="button" id="recommended-image-count" class="recommended-count-button">Use suggested</button>
+                            </div>
+                        </div>
+                        <div class="image-count-input-row">
+                            <input type="range" id="image_count_range" min="2" max="60" step="1" value="6"
+                                aria-labelledby="image-count-heading" aria-describedby="image-count-description image-count-detail">
+                            <label class="sr-only" for="image_count">Number of images</label>
+                            <input type="number" id="image_count" name="image_count" min="2" max="60" step="1" value="6"
+                                inputmode="numeric" aria-describedby="image-count-description image-count-detail">
+                        </div>
+                        <p id="image-count-detail" class="image-count-detail" aria-live="polite">About 7 seconds per image. More images create faster cuts and take longer to generate.</p>
+                    </div>
+
+                    <!-- Aspect Ratio Profiles -->
+                    <div class="space-y-2">
+                        <label class="text-sm text-slate-300 font-medium block">Aspect Ratio & Resolution Profile</label>
+                        <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                            {% for key, prof in resolution_profiles.items() %}
+                            <label class="cursor-pointer">
+                                <input
+                                    type="radio"
+                                    name="aspect_ratio"
+                                    value="{{ key }}"
+                                    class="peer sr-only"
+                                    {% if key == '16:9' %}checked{% endif %}
+                                >
+                                <div class="rounded-xl border border-slate-800 bg-surface-950/60 p-3 text-center transition-all peer-checked:border-brand-500 peer-checked:bg-brand-500/10 peer-checked:shadow-lg peer-checked:shadow-brand-500/10 hover:border-slate-700">
+                                    <div class="text-xs font-bold text-white mb-1">{{ prof.name }}</div>
+                                    <div class="text-[11px] font-mono text-slate-400">{{ prof.width }}x{{ prof.height }}</div>
+                                </div>
+                            </label>
+                            {% endfor %}
+                        </div>
+                    </div>
+
+                    <!-- Style Preset & Aura Voice Selectors -->
+                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2">
+                        <!-- Style Preset -->
+                        <div class="space-y-1.5">
+                            <label for="style_preset" class="text-xs font-semibold text-slate-300">
+                                Visual Consistency Preset
+                            </label>
+                            <select
+                                id="style_preset"
+                                name="style_preset"
+                                class="w-full bg-surface-950 border border-slate-800 focus:border-brand-500 rounded-xl px-3 py-2 text-sm text-slate-200"
+                            >
+                                {% for key, style in style_presets.items() %}
+                                <option value="{{ key }}" {% if key == 'cinematic' %}selected{% endif %}>
+                                    {{ style.label }}
+                                </option>
+                                {% endfor %}
+                            </select>
+                            <figure class="style-preview" id="style-preview" aria-live="polite">
+                                <div class="style-preview-frame">
+                                    <div class="style-preview-placeholder" id="style-preview-placeholder"><i class="fa-regular fa-image" aria-hidden="true"></i><span>Bundled style preview is not installed yet.</span></div>
+                                    <img id="style-preview-image" src="{{ url_for('static', filename='previews/styles/cinematic.svg') }}" alt="Cinematic style example: a cottage beside a lake, rendered in this style.">
+                                </div>
+                                <figcaption><strong id="style-preview-title">Style example</strong><span id="style-preview-status">Fixed illustrative artwork. Selecting a style only loads its bundled file.</span></figcaption>
+                            </figure>
+                        </div>
+
+                        <!-- Voice Selector -->
+                        <div class="space-y-1.5">
+                            <label for="tts_voice" class="text-xs font-semibold text-slate-300">
+                                Deepgram Aura Voice
+                            </label>
+                            <select
+                                id="tts_voice"
+                                name="tts_voice"
+                                class="w-full bg-surface-950 border border-slate-800 focus:border-brand-500 rounded-xl px-3 py-2 text-sm text-slate-200"
+                            >
+                                {% for v in voices %}
+                                <option value="{{ v.id }}" {% if v.id == default_voice %}selected{% endif %}>
+                                    {{ v.name }}
+                                </option>
+                                {% endfor %}
+                            </select>
+                            <button type="button" id="preview-voice-btn" class="voice-preview-button"><i class="fa-solid fa-play" aria-hidden="true"></i><span>Preview selected voice</span></button>
+                            <p class="voice-sample-text">“{{ voice_preview_text }}”</p>
+                            <p id="voice-preview-status" class="preview-status" aria-live="polite">Fixed sample audio. Playing it does not call Deepgram.</p>
+                            <audio id="voice-preview-audio" controls preload="none" hidden aria-label="Selected voice sample"></audio>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Submit Button -->
+                <button
+                    type="submit"
+                    id="submit-job-btn"
+                    class="w-full py-4 px-6 rounded-2xl bg-gradient-to-r from-brand-600 via-indigo-600 to-cyan-500 hover:from-brand-500 hover:to-cyan-400 text-white font-bold text-base shadow-xl shadow-brand-600/30 transition-all duration-200 flex items-center justify-center space-x-3 active:scale-[0.99]"
+                >
+                    <i class="fa-solid fa-film text-lg"></i>
+                    <span>Create video</span>
+                </button>
+            </form>
+        </div>
+
+        <!-- Right Column: Real-Time Pipeline Tracker & Storyboard (5 Cols) -->
+        <div class="lg:col-span-5 space-y-6">
+
+            <!-- Pipeline Status Monitor Card -->
+            <div id="pipeline-monitor-card" class="bg-surface-900/90 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-5">
+                <div class="flex items-center justify-between">
+                    <h3 class="text-sm font-semibold text-slate-200 flex items-center space-x-2">
+                        <i class="fa-solid fa-diagram-project text-brand-400"></i>
+                        <span>Production progress</span>
+                    </h3>
+                    <span id="job-status-badge" class="px-2.5 py-1 rounded-full text-xs font-bold font-mono bg-slate-800 text-slate-400 border border-slate-700">
+                        STANDBY
+                    </span>
+                </div>
+
+                <!-- Progress Bar -->
+                <div class="space-y-2">
+                    <div class="flex justify-between items-center text-xs">
+                        <span id="current-stage-label" class="text-slate-300 font-semibold">Awaiting Request</span>
+                        <span id="progress-percentage" class="font-mono text-brand-400 font-bold">0%</span>
+                    </div>
+                    <div class="w-full bg-surface-950 rounded-full h-3.5 p-0.5 border border-slate-800 overflow-hidden">
+                        <div id="progress-bar-fill" class="h-full rounded-full bg-gradient-to-r from-brand-600 via-indigo-500 to-cyan-400 transition-all duration-300" style="width: 0%;"></div>
+                    </div>
+                    <p id="step-description-text" class="text-xs text-slate-400 italic">
+                        Your production steps and render progress will appear here.
+                    </p>
+                </div>
+
+                <!-- Pipeline Stages Checklist -->
+                <div class="space-y-2 pt-2 border-t border-slate-800/80">
+                    <div id="stage-step-1" class="flex items-center space-x-3 text-xs text-slate-500 py-1 transition">
+                        <i class="fa-solid fa-circle-check"></i>
+                        <span>1. Narrative Decomposition (LLM Director)</span>
+                    </div>
+                    <div id="stage-step-2" class="flex items-center space-x-3 text-xs text-slate-500 py-1 transition">
+                        <i class="fa-solid fa-circle-check"></i>
+                        <span>2. Voiceover Synthesis (Deepgram Aura)</span>
+                    </div>
+                    <div id="stage-step-3" class="flex items-center space-x-3 text-xs text-slate-500 py-1 transition">
+                        <i class="fa-solid fa-circle-check"></i>
+                        <span>3. Generative Visuals (FLUX.2 Klein 4B)</span>
+                    </div>
+                    <div id="stage-step-4" class="flex items-center space-x-3 text-xs text-slate-500 py-1 transition">
+                        <i class="fa-solid fa-circle-check"></i>
+                        <span>4. Motion & Ken Burns Transforms</span>
+                    </div>
+                    <div id="stage-step-5" class="flex items-center space-x-3 text-xs text-slate-500 py-1 transition">
+                        <i class="fa-solid fa-circle-check"></i>
+                        <span>5. Crossfade Assembly & H.264 Render</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Video Player Card (Hidden until complete) -->
+            <div id="video-player-card" class="hidden bg-surface-900 border border-brand-500/40 rounded-2xl p-6 shadow-2xl shadow-brand-500/10 space-y-4">
+                <div class="flex items-center justify-between">
+                    <h3 class="text-sm font-bold text-white flex items-center space-x-2">
+                        <i class="fa-solid fa-circle-play text-cyan-400 text-lg"></i>
+                        <span>Master Video Output</span>
+                    </h3>
+                    <span class="text-xs font-mono text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20">
+                        Production Ready
+                    </span>
+                </div>
+
+                <!-- Embedded Video Player -->
+                <div class="rounded-xl overflow-hidden bg-black aspect-video border border-slate-800 shadow-inner flex items-center justify-center">
+                    <video id="master-video-player" controls class="w-full h-full object-contain"></video>
+                </div>
+
+                <!-- Video Actions & Summary Stats -->
+                <div class="flex items-center justify-between pt-2">
+                    <div id="video-stats-summary" class="text-xs text-slate-400 font-mono">
+                        Duration: -- | Render: --
+                    </div>
+                    <a
+                        id="download-video-btn"
+                        href="#"
+                        download
+                        class="px-4 py-2 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-surface-950 font-bold text-xs flex items-center space-x-2 shadow-lg transition"
+                    >
+                        <i class="fa-solid fa-download"></i>
+                        <span>Download MP4</span>
+                    </a>
+                </div>
+
+                <!-- Direct File Location Box -->
+                <div class="rounded-xl bg-surface-950 border border-slate-800 p-3 space-y-1.5 text-xs font-mono">
+                    <div class="flex items-center justify-between text-slate-400">
+                        <span class="flex items-center space-x-1 text-slate-300">
+                            <i class="fa-solid fa-folder-open text-brand-400"></i>
+                            <span>Local Path:</span>
+                        </span>
+                        <span id="disk-path-display" class="text-slate-200 select-all truncate max-w-[280px]">
+                            E:\Transitional_video_automation\static\exports\...
+                        </span>
+                    </div>
+                    <div class="flex items-center justify-between text-slate-400">
+                        <span class="flex items-center space-x-1 text-slate-300">
+                            <i class="fa-solid fa-globe text-cyan-400"></i>
+                            <span>Web URL:</span>
+                        </span>
+                        <a id="direct-url-display" href="#" target="_blank" class="text-cyan-400 hover:underline select-all truncate max-w-[280px]">
+                            http://localhost:5000/exports/...
+                        </a>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Dynamic Storyboard Scenes Grid -->
+            <div id="storyboard-container" class="space-y-3">
+                <div class="flex items-center justify-between">
+                    <h4 class="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center space-x-2">
+                        <i class="fa-solid fa-film text-brand-400"></i>
+                        <span>Storyboard</span>
+                    </h4>
+                    <span id="storyboard-count-badge" class="text-[11px] font-mono text-slate-500">0 Scenes</span>
+                </div>
+
+                <div id="scenes-grid" class="space-y-3 max-h-[480px] overflow-y-auto pr-1">
+                    <!-- Scene cards inserted dynamically via JS -->
+                    <div class="rounded-xl border border-slate-800 bg-surface-900/40 p-4 text-center text-xs text-slate-500">
+                        Scenes will appear here dynamically as the LLM Director generates manifests.
+                    </div>
+                </div>
+            </div>
+
+            <!-- Live Terminal Log Accordion -->
+            <div class="bg-surface-950 border border-slate-800 rounded-2xl overflow-hidden">
+                <button type="button" id="toggle-terminal-btn" class="w-full px-4 py-3 bg-surface-900/60 hover:bg-surface-900 flex items-center justify-between text-xs font-mono text-slate-300 transition">
+                    <span class="flex items-center space-x-2">
+                        <i class="fa-solid fa-terminal text-cyan-400"></i>
+                        <span>Live Pipeline Console</span>
+                    </span>
+                    <i id="terminal-chevron" class="fa-solid fa-chevron-down text-slate-500 transition-transform"></i>
+                </button>
+                <div id="terminal-content" class="p-4 bg-surface-950 font-mono text-xs text-slate-400 max-h-52 overflow-y-auto space-y-1">
+                    <div class="text-slate-600">[System] Ready for pipeline execution.</div>
+                </div>
+            </div>
+
+        </div>
+    </div>
+</div>
+{% endblock %}
+{% block scripts %}<script src="{{ url_for('static', filename='js/main.js') }}"></script>{% endblock %}

@@ -1,0 +1,36 @@
+# Local credentials. Keep only the documented, empty template in Git.
+.env
+.env.*
+!.env.example
+
+# Runtime state and generated user media (ephemeral locally; Supabase in deploy).
+instance/
+temp/
+tmp*/
+static/exports/
+*.sqlite
+*.sqlite3
+*.db
+*.db-*
+
+# Python caches and virtual environments.
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Build/editor/OS artifacts.
+build/
+dist/
+node_modules/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log

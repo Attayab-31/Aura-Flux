@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}{% if auth_mode == 'signup' %}Create account{% else %}Sign in{% endif %} — AuraFLUX Studio{% endblock %}
+{% block breadcrumb %}Your secure workspace{% endblock %}
+{% block content %}
+<section class="auth-layout">
+    <div class="auth-card">
+        <div class="auth-icon"><i class="fa-solid fa-clapperboard" aria-hidden="true"></i></div>
+        <p class="eyebrow">PRIVATE VIDEO WORKSPACE</p>
+        <h1>{% if auth_mode == 'signup' %}Create your account{% else %}Welcome back{% endif %}</h1>
+        <p class="auth-intro">{% if auth_mode == 'signup' %}Save your projects and return to them whenever you need.{% else %}Sign in to continue to your projects.{% endif %}</p>
+        {% if error %}<p class="auth-error" role="alert">{{ error }}</p>{% endif %}
+        <form method="post" action="{{ url_for(auth_mode) }}" class="auth-form">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            {% if auth_mode == 'login' %}<input type="hidden" name="next" value="{{ next_path }}">{% endif %}
+            <div><label for="email">Email address</label><input id="email" name="email" type="email" autocomplete="email" maxlength="254" required autofocus value="{{ request.form.get('email', '') }}" placeholder="you@example.com"></div>
+            <div><label for="password">Password</label><input id="password" name="password" type="password" autocomplete="{% if auth_mode == 'signup' %}new-password{% else %}current-password{% endif %}" minlength="12" maxlength="128" required placeholder="At least 12 characters"></div>
+            {% if auth_mode == 'signup' %}<div><label for="password_confirmation">Confirm password</label><input id="password_confirmation" name="password_confirmation" type="password" autocomplete="new-password" minlength="12" maxlength="128" required placeholder="Enter the same password again"></div>{% endif %}
+            <button class="button-primary auth-submit" type="submit">{% if auth_mode == 'signup' %}Create account{% else %}Sign in{% endif %}<i class="fa-solid fa-arrow-right" aria-hidden="true"></i></button>
+        </form>
+        <p class="auth-switch">{% if auth_mode == 'signup' %}Already have an account? <a href="{{ url_for('login') }}">Sign in</a>{% else %}New to AuraFLUX? <a href="{{ url_for('signup') }}">Create an account</a>{% endif %}</p>
+        <p class="auth-security"><i class="fa-solid fa-lock" aria-hidden="true"></i> Your projects are private to your account.</p>
+    </div>
+</section>
+{% endblock %}

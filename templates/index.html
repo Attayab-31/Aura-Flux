@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}Overview — AuraFLUX Studio{% endblock %}
+{% block breadcrumb %}Overview{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <div><p class="eyebrow">YOUR CREATIVE WORKSPACE</p><h1>Good stories deserve room to grow.</h1><p class="page-subtitle">Create a narrated video from a script, then follow the production from first scene to final render.</p></div>
+  <a href="{{ url_for('create_page') }}" class="button-primary"><i class="fa-solid fa-plus" aria-hidden="true"></i> Start a video</a>
+</section>
+<section class="welcome-panel">
+  <div class="welcome-copy"><span class="soft-badge">VIDEO CREATION</span><h2>From a few paragraphs to a complete video.</h2><p>Set your pacing, choose a format and voice, and let the studio handle the scenes, visuals, narration and assembly.</p><a class="text-link" href="{{ url_for('create_page') }}">Create your first video <i class="fa-solid fa-arrow-right" aria-hidden="true"></i></a></div>
+  <div class="welcome-art" aria-hidden="true"><div class="art-frame"><i class="fa-solid fa-play"></i></div><span class="art-line"></span><span class="art-dot"></span></div>
+</section>
+<section class="section-heading"><div><p class="eyebrow">WORKSPACE</p><h2>Recent projects</h2></div><a class="text-link" href="{{ url_for('projects_page') }}">View all <i class="fa-solid fa-arrow-right" aria-hidden="true"></i></a></section>
+{% if jobs %}
+<div class="project-list">
+  {% for job in jobs %}
+  <article class="project-row"><span class="project-thumb"><i class="fa-solid fa-film" aria-hidden="true"></i></span><div class="project-info"><strong>{{ job.title }}</strong><span>{{ job.stage or 'Queued' }}</span></div><span class="status-chip status-{{ job.status|lower }}">{{ job.status|title }}</span><div class="project-progress"><div><span>Progress</span><strong>{{ job.progress_percent }}%</strong></div><div class="progress-track"><span style="width:{{ job.progress_percent }}%"></span></div></div>{% if job.video_url %}<a class="row-action" href="{{ job.video_url }}" download aria-label="Download finished video"><i class="fa-solid fa-download"></i></a>{% else %}<span class="row-action muted" aria-hidden="true"><i class="fa-solid fa-ellipsis"></i></span>{% endif %}</article>
+  {% endfor %}
+</div>
+{% else %}
+<div class="empty-state"><span class="empty-icon"><i class="fa-regular fa-folder-open" aria-hidden="true"></i></span><h3>Your projects will live here</h3><p>Start with a script and your first project will appear in this space.</p><a class="button-secondary" href="{{ url_for('create_page') }}">Create a video</a></div>
+{% endif %}
+<section class="steps-grid" aria-label="How video creation works"><article><span>01</span><h3>Shape your story</h3><p>Paste in a script or start from one of the samples.</p></article><article><span>02</span><h3>Set the feel</h3><p>Choose pacing, image format, visual style and narration.</p></article><article><span>03</span><h3>Watch it come together</h3><p>Follow progress and download the finished video.</p></article></section>
+{% endblock %}

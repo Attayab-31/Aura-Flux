@@ -1,0 +1,841 @@
+"""SQLite persistence for accounts, projects, login throttling, and durable jobs."""
+
+import json
+import os
+import sqlite3
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
+
+try:
+    import psycopg
+    from psycopg import errors as pg_errors
+    from psycopg.rows import dict_row
+except ImportError:  # PostgreSQL driver is installed for deployments.
+    psycopg = None
+    pg_errors = None
+    dict_row = None
+
+
+class _Record(dict):
+    """Small SQLite-row compatible mapping for psycopg results."""
+    def __init__(self, mapping):
+        super().__init__(mapping)
+        self._keys = list(mapping)
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            key = self._keys[key]
+        return super().__getitem__(key)
+
+
+class _PostgresConnection:
+    def __init__(self, connection):
+        self.connection = connection
+
+    def execute(self, sql, params=()):
+        sql = sql.strip()
+        if sql.upper() == "BEGIN IMMEDIATE":
+            # Preserve SQLite's serialized write-section semantics for bounded
+            # queue capacity checks and multi-row state transitions.
+            return _PostgresCursor(self.connection.execute("SELECT pg_advisory_xact_lock(91384017)"))
+        ignored = sql.upper().startswith("PRAGMA ")
+        if ignored:
+            return _PostgresCursor(self.connection.execute("SELECT 1"))
+        ignore_insert = sql.upper().startswith("INSERT OR IGNORE INTO ")
+        if ignore_insert:
+            sql = sql.replace("INSERT OR IGNORE INTO", "INSERT INTO", 1)
+        sql = sql.replace("?", "%s")
+        if ignore_insert:
+            sql += " ON CONFLICT DO NOTHING"
+        return _PostgresCursor(self.connection.execute(sql, params))
+
+    def executescript(self, sql):
+        for statement in sql.split(";"):
+            if statement.strip():
+                self.execute(statement)
+
+    def commit(self):
+        self.connection.commit()
+
+    def rollback(self):
+        self.connection.rollback()
+
+    def close(self):
+        self.connection.close()
+
+
+class _PostgresCursor:
+    def __init__(self, cursor):
+        self.cursor = cursor
+        self.rowcount = cursor.rowcount
+
+    def fetchone(self):
+        row = self.cursor.fetchone()
+        return _Record(row) if row is not None else None
+
+    def fetchall(self):
+        return [_Record(row) for row in self.cursor.fetchall()]
+
+
+class AuthStore:
+    def __init__(self, database_path: Path):
+        self.database_url = os.getenv("SUPABASE_DB_URL", "").strip() or os.getenv("DATABASE_URL", "").strip()
+        self.use_postgres = bool(self.database_url)
+        if os.getenv("RENDER", "").lower() == "true" and not self.use_postgres:
+            raise RuntimeError("Configure SUPABASE_DB_URL in Render; SQLite is not durable on a free Render service.")
+        if self.use_postgres and psycopg is None:
+            raise RuntimeError("Install psycopg[binary] to use SUPABASE_DB_URL or DATABASE_URL.")
+        self.database_path = Path(database_path)
+        if not self.use_postgres:
+            self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        self.initialize()
+
+    @contextmanager
+    def connect(self):
+        if self.use_postgres:
+            raw = psycopg.connect(self.database_url, connect_timeout=10,
+                                  prepare_threshold=None, sslmode="require", row_factory=dict_row)
+            connection = _PostgresConnection(raw)
+        else:
+            connection = sqlite3.connect(self.database_path, timeout=15)
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+        try:
+            yield connection
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def initialize(self) -> None:
+        if self.use_postgres:
+            self._initialize_postgres()
+            return
+        with self.connect() as db:
+            db.execute("PRAGMA journal_mode = WAL")
+            db.executescript("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    email TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                    password_hash TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS projects (
+                    id TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    state_json TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS projects_owner_updated
+                    ON projects(user_id, updated_at DESC);
+                CREATE TABLE IF NOT EXISTS jobs (
+                    queue_order INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL UNIQUE,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    task_type TEXT NOT NULL,
+                    options_json TEXT NOT NULL,
+                    state_json TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    progress_percent INTEGER NOT NULL DEFAULT 0,
+                    stage TEXT NOT NULL DEFAULT 'Queued',
+                    step_description TEXT NOT NULL DEFAULT '',
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    started_at REAL,
+                    finished_at REAL,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    lease_owner TEXT,
+                    lease_until REAL,
+                    available_at REAL NOT NULL DEFAULT 0,
+                    output_json TEXT NOT NULL DEFAULT '{}',
+                    sanitized_error TEXT
+                );
+                CREATE INDEX IF NOT EXISTS jobs_queue_order
+                    ON jobs(status, available_at, queue_order);
+                CREATE INDEX IF NOT EXISTS jobs_owner_created
+                    ON jobs(user_id, created_at DESC);
+                CREATE TABLE IF NOT EXISTS gpu_requests (
+                    enqueue_order INTEGER PRIMARY KEY AUTOINCREMENT,
+                    request_id TEXT NOT NULL UNIQUE,
+                    parent_task_id TEXT NOT NULL,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    request_type TEXT NOT NULL DEFAULT 'image',
+                    prompt TEXT NOT NULL,
+                    width INTEGER NOT NULL,
+                    height INTEGER NOT NULL,
+                    seed INTEGER,
+                    strength REAL NOT NULL DEFAULT 1.0,
+                    reference_image_path TEXT,
+                    output_key TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    worker_run_id TEXT,
+                    lease_until REAL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    started_at REAL,
+                    finished_at REAL,
+                    image_path TEXT,
+                    image_width INTEGER,
+                    image_height INTEGER,
+                    elapsed_seconds REAL,
+                    sanitized_error TEXT
+                );
+                CREATE INDEX IF NOT EXISTS gpu_queue_order ON gpu_requests(status, enqueue_order);
+                CREATE INDEX IF NOT EXISTS gpu_owner_parent ON gpu_requests(user_id,parent_task_id);
+                CREATE TABLE IF NOT EXISTS gpu_supervisor (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                    lease_owner TEXT,
+                    lease_until REAL,
+                    heartbeat_at REAL,
+                    worker_heartbeat_at REAL,
+                    state TEXT NOT NULL DEFAULT 'idle',
+                    active_dispatch_id TEXT,
+                    worker_run_id TEXT,
+                    kernel_id TEXT,
+                    started_at REAL,
+                    last_poll_at REAL,
+                    last_result TEXT,
+                    unavailable_reason TEXT,
+                    last_error_at REAL
+                );
+                INSERT OR IGNORE INTO gpu_supervisor(singleton,state) VALUES(1,'idle');
+                CREATE TABLE IF NOT EXISTS gpu_runs (
+                    dispatch_id TEXT PRIMARY KEY,
+                    worker_run_id TEXT,
+                    state TEXT NOT NULL,
+                    started_at REAL NOT NULL,
+                    finished_at REAL,
+                    last_poll_at REAL,
+                    result TEXT,
+                    elapsed_seconds REAL NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS login_attempts (
+                    identity_hash TEXT NOT NULL,
+                    attempted_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS login_attempts_recent
+                    ON login_attempts(identity_hash, attempted_at);
+            """)
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(jobs)").fetchall()}
+            if "started_at" not in columns:
+                db.execute("ALTER TABLE jobs ADD COLUMN started_at REAL")
+            if "finished_at" not in columns:
+                db.execute("ALTER TABLE jobs ADD COLUMN finished_at REAL")
+            supervisor_columns = {row["name"] for row in db.execute("PRAGMA table_info(gpu_supervisor)").fetchall()}
+            if "worker_heartbeat_at" not in supervisor_columns:
+                db.execute("ALTER TABLE gpu_supervisor ADD COLUMN worker_heartbeat_at REAL")
+            gpu_columns = {row["name"] for row in db.execute("PRAGMA table_info(gpu_requests)").fetchall()}
+            if "reference_image_path" not in gpu_columns:
+                db.execute("ALTER TABLE gpu_requests ADD COLUMN reference_image_path TEXT")
+        self.migrate_legacy_projects()
+
+    def _initialize_postgres(self) -> None:
+        """Create the same durable queue schema on Supabase PostgreSQL."""
+        schema = """
+        CREATE TABLE IF NOT EXISTS users (
+            id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+            email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, created_at DOUBLE PRECISION NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS projects (
+            id TEXT PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            state_json TEXT NOT NULL, created_at DOUBLE PRECISION NOT NULL, updated_at DOUBLE PRECISION NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS projects_owner_updated ON projects(user_id,updated_at DESC);
+        CREATE TABLE IF NOT EXISTS jobs (
+            queue_order BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+            task_id TEXT NOT NULL UNIQUE, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            task_type TEXT NOT NULL, options_json TEXT NOT NULL, state_json TEXT NOT NULL, status TEXT NOT NULL,
+            progress_percent INTEGER NOT NULL DEFAULT 0, stage TEXT NOT NULL DEFAULT 'Queued',
+            step_description TEXT NOT NULL DEFAULT '', created_at DOUBLE PRECISION NOT NULL,
+            updated_at DOUBLE PRECISION NOT NULL, started_at DOUBLE PRECISION, finished_at DOUBLE PRECISION,
+            attempt_count INTEGER NOT NULL DEFAULT 0, lease_owner TEXT, lease_until DOUBLE PRECISION,
+            available_at DOUBLE PRECISION NOT NULL DEFAULT 0, output_json TEXT NOT NULL DEFAULT '{}', sanitized_error TEXT
+        );
+        CREATE INDEX IF NOT EXISTS jobs_queue_order ON jobs(status,available_at,queue_order);
+        CREATE INDEX IF NOT EXISTS jobs_owner_created ON jobs(user_id,created_at DESC);
+        CREATE TABLE IF NOT EXISTS gpu_requests (
+            enqueue_order BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+            request_id TEXT NOT NULL UNIQUE, parent_task_id TEXT NOT NULL,
+            user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            request_type TEXT NOT NULL DEFAULT 'image', prompt TEXT NOT NULL, width INTEGER NOT NULL, height INTEGER NOT NULL,
+            seed BIGINT, strength DOUBLE PRECISION NOT NULL DEFAULT 1.0, reference_image_path TEXT, output_key TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'queued', attempts INTEGER NOT NULL DEFAULT 0, worker_run_id TEXT,
+            lease_until DOUBLE PRECISION, created_at DOUBLE PRECISION NOT NULL, updated_at DOUBLE PRECISION NOT NULL,
+            started_at DOUBLE PRECISION, finished_at DOUBLE PRECISION, image_path TEXT, image_width INTEGER,
+            image_height INTEGER, elapsed_seconds DOUBLE PRECISION, sanitized_error TEXT
+        );
+        CREATE INDEX IF NOT EXISTS gpu_queue_order ON gpu_requests(status,enqueue_order);
+        CREATE INDEX IF NOT EXISTS gpu_owner_parent ON gpu_requests(user_id,parent_task_id);
+        CREATE TABLE IF NOT EXISTS gpu_supervisor (
+            singleton INTEGER PRIMARY KEY CHECK(singleton=1), lease_owner TEXT, lease_until DOUBLE PRECISION,
+            heartbeat_at DOUBLE PRECISION, worker_heartbeat_at DOUBLE PRECISION, state TEXT NOT NULL DEFAULT 'idle',
+            active_dispatch_id TEXT, worker_run_id TEXT, kernel_id TEXT, started_at DOUBLE PRECISION,
+            last_poll_at DOUBLE PRECISION, last_result TEXT, unavailable_reason TEXT, last_error_at DOUBLE PRECISION
+        );
+        INSERT INTO gpu_supervisor(singleton,state) VALUES(1,'idle') ON CONFLICT(singleton) DO NOTHING;
+        CREATE TABLE IF NOT EXISTS gpu_runs (
+            dispatch_id TEXT PRIMARY KEY, worker_run_id TEXT, state TEXT NOT NULL, started_at DOUBLE PRECISION NOT NULL,
+            finished_at DOUBLE PRECISION, last_poll_at DOUBLE PRECISION, result TEXT,
+            elapsed_seconds DOUBLE PRECISION NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS login_attempts (
+            identity_hash TEXT NOT NULL, attempted_at DOUBLE PRECISION NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS login_attempts_recent ON login_attempts(identity_hash,attempted_at);
+        ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE projects ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE jobs ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE gpu_requests ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE gpu_supervisor ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE gpu_runs ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE login_attempts ENABLE ROW LEVEL SECURITY;
+        """
+        with self.connect() as db:
+            db.executescript(schema)
+        self.migrate_legacy_projects()
+
+    def migrate_legacy_projects(self) -> None:
+        """Make existing SQLite project records visible to the durable queue."""
+        with self.connect() as db:
+            rows = db.execute("SELECT id, user_id, state_json FROM projects ORDER BY created_at, id").fetchall()
+            for row in rows:
+                try:
+                    state = json.loads(row["state_json"])
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                status = str(state.get("status", "FAILED")).upper()
+                if status in {"QUEUED", "RUNNING", "PROCESSING"}:
+                    # Resume interrupted work from the durable queue; no external
+                    # call is made during this schema migration.
+                    status = "QUEUED"
+                    state["status"] = status
+                    state["stage"] = "Queued for recovery"
+                    state["step_description"] = "Resumed after application restart."
+                    state.pop("error_traceback", None)
+                elif status == "FAILED":
+                    state["error"] = "Generation failed. Please try again."
+                    state["step_description"] = "Generation failed. Please try again."
+                    state.pop("error_traceback", None)
+                params = state.get("params") or {}
+                task_type = "image" if params.get("_task_type") == "image" or state.get("image_path") else "video"
+                options = params if task_type == "image" else {**params, "story_text": state.get("story_text", "")}
+                state.setdefault("task_id", row["id"])
+                state.setdefault("job_id", row["id"])
+                state.setdefault("owner_id", row["user_id"])
+                state.setdefault("task_type", task_type)
+                created_at = float(state.get("created_at", time.time()))
+                updated_at = float(state.get("updated_at", created_at))
+                db.execute("""
+                    INSERT OR IGNORE INTO jobs
+                    (task_id,user_id,task_type,options_json,state_json,status,progress_percent,
+                     stage,step_description,created_at,updated_at,started_at,finished_at,
+                     available_at,output_json,sanitized_error)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """, (row["id"], row["user_id"], task_type,
+                      json.dumps(options, ensure_ascii=False), json.dumps(state, ensure_ascii=False),
+                      status, int(state.get("progress_percent", 0)), str(state.get("stage", "Queued")),
+                      str(state.get("step_description", "")), created_at, updated_at,
+                      state.get("started_at"), state.get("finished_at", updated_at if status in {"COMPLETED", "FAILED"} else None), 0,
+                      json.dumps({k: state.get(k) for k in ("image_path", "video_url", "scenes") if state.get(k)}, ensure_ascii=False),
+                      "Generation failed. Please try again." if status == "FAILED" else None))
+
+    def enqueue_job(self, task_id: str, user_id: int, task_type: str,
+                    options: dict[str, Any], state: dict[str, Any], max_waiting: int = 100) -> int | None:
+        """Atomically enforce waiting capacity and persist a new FIFO job."""
+        now = float(state.get("created_at", time.time()))
+        options_json = json.dumps(options, ensure_ascii=False, separators=(",", ":"))
+        state_json = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            waiting = db.execute("SELECT COUNT(*) FROM jobs WHERE status='QUEUED'").fetchone()[0]
+            if int(waiting) >= max_waiting:
+                return None
+            db.execute("""
+                INSERT INTO jobs(task_id,user_id,task_type,options_json,state_json,status,
+                    progress_percent,stage,step_description,created_at,updated_at,available_at,
+                    output_json,sanitized_error)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (task_id, user_id, task_type, options_json, state_json,
+                  state.get("status", "QUEUED"), int(state.get("progress_percent", 0)),
+                  str(state.get("stage", "Queued")), str(state.get("step_description", "")),
+                  now, now, now, "{}", None))
+            db.execute("""
+                INSERT INTO projects(id,user_id,state_json,created_at,updated_at)
+                VALUES(?,?,?,?,?)
+                ON CONFLICT(id) DO UPDATE SET state_json=excluded.state_json, updated_at=excluded.updated_at
+            """, (task_id, user_id, state_json, now, now))
+            row = db.execute("SELECT queue_order FROM jobs WHERE task_id=?", (task_id,)).fetchone()
+            return int(db.execute("SELECT COUNT(*) FROM jobs WHERE status='QUEUED' AND queue_order<=?",
+                                  (row[0],)).fetchone()[0])
+
+    def load_jobs(self) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute("SELECT state_json FROM jobs ORDER BY queue_order").fetchall()
+            return [json.loads(row["state_json"]) for row in rows]
+
+    def save_job_state(self, task_id: str, state: dict[str, Any]) -> None:
+        """Persist state and mirrored project JSON without holding locks over work."""
+        status = str(state.get("status", "FAILED")).upper()
+        db_status = "PROCESSING" if status == "RUNNING" else status
+        options = state.get("params") or {}
+        output = {key: state.get(key) for key in ("image_path", "video_url", "scenes") if state.get(key)}
+        state_json = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
+        updated_at = float(state.get("updated_at", time.time()))
+        with self.connect() as db:
+            db.execute("""
+                UPDATE jobs SET options_json=?,state_json=?,status=?,progress_percent=?,stage=?,
+                    step_description=?,updated_at=?,output_json=?,sanitized_error=?,
+                    lease_owner=CASE WHEN ? IN ('COMPLETED','FAILED') THEN NULL ELSE lease_owner END,
+                    lease_until=CASE WHEN ? IN ('COMPLETED','FAILED') THEN NULL ELSE lease_until END,
+                    finished_at=CASE WHEN ? IN ('COMPLETED','FAILED') THEN ? ELSE finished_at END
+                    WHERE task_id=?
+            """, (json.dumps(options, ensure_ascii=False, separators=(",", ":")), state_json,
+                  db_status, int(state.get("progress_percent", 0)), str(state.get("stage", "")),
+                  str(state.get("step_description", "")), updated_at,
+                  json.dumps(output, ensure_ascii=False), state.get("error"), db_status, db_status,
+                  db_status, updated_at if db_status in {"COMPLETED", "FAILED"} else None, task_id))
+            db.execute("UPDATE projects SET state_json=?,updated_at=? WHERE id=?",
+                       (state_json, updated_at, task_id))
+
+    def claim_next_job(self, worker_id: str, lease_seconds: int = 180) -> dict[str, Any] | None:
+        """Atomically claim the oldest eligible job and increment its attempt."""
+        now = time.time()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            expired_sql = """
+                SELECT task_id,state_json,attempt_count FROM jobs
+                WHERE status='PROCESSING' AND lease_until < ? ORDER BY queue_order
+            """
+            if self.use_postgres:
+                expired_sql += " FOR UPDATE SKIP LOCKED"
+            expired = db.execute(expired_sql, (now,)).fetchall()
+            for row in expired:
+                state = json.loads(row["state_json"])
+                if int(row["attempt_count"]) < 3:
+                    state.update(status="QUEUED", stage="Queued for recovery",
+                                 step_description="Worker lease expired; task returned to the queue.", updated_at=now)
+                    db.execute("""UPDATE jobs SET status='QUEUED',state_json=?,stage=?,step_description=?,
+                        updated_at=?,finished_at=NULL,lease_owner=NULL,lease_until=NULL,available_at=? WHERE task_id=?""",
+                               (json.dumps(state, ensure_ascii=False), state["stage"], state["step_description"], now, now, row["task_id"]))
+                    db.execute("UPDATE projects SET state_json=?,updated_at=? WHERE id=?",
+                               (json.dumps(state, ensure_ascii=False), now, row["task_id"]))
+                else:
+                    state.update(status="FAILED", stage="Failed",
+                                 step_description="The task stopped after repeated worker interruptions.",
+                                 error="Task interrupted repeatedly; please submit it again.",
+                                 updated_at=now, finished_at=now)
+                    db.execute("""UPDATE jobs SET status='FAILED',state_json=?,stage=?,step_description=?,
+                        sanitized_error=?,updated_at=?,finished_at=?,lease_owner=NULL,lease_until=NULL WHERE task_id=?""",
+                               (json.dumps(state, ensure_ascii=False), state["stage"], state["step_description"],
+                                 state["error"], now, now, row["task_id"]))
+                    db.execute("UPDATE projects SET state_json=?,updated_at=? WHERE id=?",
+                               (json.dumps(state, ensure_ascii=False), now, row["task_id"]))
+            claim_sql = """
+                SELECT task_id,state_json,attempt_count FROM jobs
+                WHERE status='QUEUED' AND available_at<=? ORDER BY queue_order LIMIT 1
+            """
+            if self.use_postgres:
+                claim_sql += " FOR UPDATE SKIP LOCKED"
+            row = db.execute(claim_sql, (now,)).fetchone()
+            if row is None:
+                return None
+            state = json.loads(row["state_json"])
+            attempt = int(row["attempt_count"]) + 1
+            state.update(status="RUNNING", stage=state.get("stage") or "Starting",
+                         step_description=state.get("step_description") or "Task started.",
+                         updated_at=now, started_at=now, attempt_count=attempt)
+            db.execute("""UPDATE jobs SET status='PROCESSING',state_json=?,updated_at=?,started_at=?,
+                finished_at=NULL,attempt_count=?,lease_owner=?,lease_until=? WHERE task_id=? AND status='QUEUED'""",
+                       (json.dumps(state, ensure_ascii=False), now, now, attempt, worker_id, now + lease_seconds, row["task_id"]))
+            db.execute("UPDATE projects SET state_json=?,updated_at=? WHERE id=?",
+                       (json.dumps(state, ensure_ascii=False), now, row["task_id"]))
+            return state
+
+    def heartbeat_job(self, task_id: str, worker_id: str, lease_seconds: int = 180) -> bool:
+        with self.connect() as db:
+            cursor = db.execute("UPDATE jobs SET lease_until=? WHERE task_id=? AND status='PROCESSING' AND lease_owner=?",
+                                (time.time() + lease_seconds, task_id, worker_id))
+            return cursor.rowcount == 1
+
+    def release_job(self, task_id: str, worker_id: str, error: str, delay: float = 1.0,
+                    max_attempts: int = 3) -> None:
+        now = time.time()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT state_json,attempt_count FROM jobs WHERE task_id=? AND lease_owner=?",
+                             (task_id, worker_id)).fetchone()
+            if not row:
+                return
+            state = json.loads(row["state_json"])
+            exhausted = int(row["attempt_count"]) >= max_attempts
+            status = "FAILED" if exhausted else "QUEUED"
+            safe_error = "The image worker is temporarily unavailable." if not exhausted else "Generation failed after repeated attempts. Please try again later."
+            state.update(status=status, stage="Failed" if exhausted else "Queued for retry",
+                         step_description=safe_error, error=safe_error if exhausted else None,
+                         updated_at=now)
+            if exhausted:
+                state["finished_at"] = now
+            serialized = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
+            db.execute("""UPDATE jobs SET status=?,state_json=?,stage=?,step_description=?,updated_at=?,
+                available_at=?,lease_owner=NULL,lease_until=NULL,sanitized_error=?,
+                finished_at=? WHERE task_id=?""",
+                       (status, serialized, state["stage"], state["step_description"], now,
+                        now + max(0, delay), safe_error if exhausted else None,
+                        now if exhausted else None, task_id))
+            db.execute("UPDATE projects SET state_json=?,updated_at=? WHERE id=?", (serialized, now, task_id))
+
+    def owned_job(self, task_id: str, user_id: int) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute("SELECT state_json FROM jobs WHERE task_id=? AND user_id=?", (task_id, user_id)).fetchone()
+            return json.loads(row["state_json"]) if row else None
+
+    def get_job(self, task_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute("SELECT state_json FROM jobs WHERE task_id=?", (task_id,)).fetchone()
+            return json.loads(row["state_json"]) if row else None
+
+    def list_jobs_for_user(self, user_id: int, limit: int | None = None) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            sql = "SELECT state_json FROM jobs WHERE user_id=? ORDER BY created_at DESC,queue_order DESC"
+            params: tuple[Any, ...] = (user_id,)
+            if limit is not None:
+                sql += " LIMIT ?"
+                params += (limit,)
+            return [json.loads(row["state_json"]) for row in db.execute(sql, params).fetchall()]
+
+    def recover_abandoned_jobs(self, max_attempts: int = 3) -> None:
+        """Requeue work left PROCESSING after the singleton consumer lock is acquired."""
+        now = time.time()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute("SELECT task_id,state_json,attempt_count FROM jobs WHERE status='PROCESSING'").fetchall()
+            for row in rows:
+                state = json.loads(row["state_json"])
+                failed = int(row["attempt_count"]) >= max_attempts
+                status = "FAILED" if failed else "QUEUED"
+                stage = "Failed" if failed else "Queued for recovery"
+                message = "Generation stopped after repeated worker interruptions." if failed else "Resumed after application restart."
+                state.update(status=status, stage=stage, step_description=message, updated_at=now)
+                if failed:
+                    state["error"] = "Task interrupted repeatedly; please submit it again."
+                    state["finished_at"] = now
+                serialized = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
+                db.execute("""UPDATE jobs SET status=?,state_json=?,stage=?,step_description=?,
+                    updated_at=?,finished_at=?,lease_owner=NULL,lease_until=NULL,sanitized_error=? WHERE task_id=?""",
+                           (status, serialized, stage, message, now, now if failed else None,
+                            state.get("error"), row["task_id"]))
+                db.execute("UPDATE projects SET state_json=?,updated_at=? WHERE id=?",
+                           (serialized, now, row["task_id"]))
+
+    def enqueue_gpu_requests(self, requests: list[dict[str, Any]], max_pending: int = 500) -> list[str]:
+        """Insert a complete scene batch atomically, preserving scene/FIFO order."""
+        now = time.time()
+        ids = []
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            waiting = db.execute("SELECT COUNT(*) FROM gpu_requests WHERE status='queued'").fetchone()[0]
+            new_ids = {str(item["request_id"]) for item in requests if not db.execute(
+                "SELECT 1 FROM gpu_requests WHERE request_id=?", (str(item["request_id"]),)).fetchone()}
+            if waiting + len(new_ids) > max_pending:
+                raise OverflowError("GPU request queue is full")
+            for item in requests:
+                prompt = item.get("prompt")
+                width, height = int(item.get("width", 0)), int(item.get("height", 0))
+                seed, strength = item.get("seed"), float(item.get("strength", 1.0))
+                if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 12000:
+                    raise ValueError("GPU prompt is invalid")
+                if width < 16 or height < 16 or width > 2048 or height > 2048 or width % 16 or height % 16 or width * height > 4_194_304:
+                    raise ValueError("GPU image dimensions are invalid")
+                if seed is not None and (isinstance(seed, bool) or int(seed) < 0 or int(seed) > 2**63 - 1):
+                    raise ValueError("GPU image seed is invalid")
+                if not 0.0 <= strength <= 1.0:
+                    raise ValueError("GPU image strength is invalid")
+                rid = str(item["request_id"])
+                ids.append(rid)
+                db.execute("""INSERT OR IGNORE INTO gpu_requests
+                    (request_id,parent_task_id,user_id,request_type,prompt,width,height,seed,strength,reference_image_path,
+                     output_key,status,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,'queued',?,?)""",
+                    (rid, item["parent_task_id"], item["user_id"], item.get("request_type", "image"),
+                     prompt.strip(), width, height, seed, strength, item.get("reference_image_path"), item["output_key"], now, now))
+        return ids
+
+    def gpu_queue_depth(self) -> int:
+        with self.connect() as db:
+            return int(db.execute("SELECT COUNT(*) FROM gpu_requests WHERE status='queued'").fetchone()[0])
+
+    def claim_gpu_request(self, worker_run_id: str, lease_seconds: int = 900) -> dict[str, Any] | None:
+        now = time.time()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM gpu_requests WHERE status='processing' AND worker_run_id=? ORDER BY enqueue_order LIMIT 1", (worker_run_id,)).fetchone()
+            if not row:
+                claim_sql = "SELECT * FROM gpu_requests WHERE status='queued' ORDER BY enqueue_order LIMIT 1"
+                if self.use_postgres:
+                    claim_sql += " FOR UPDATE SKIP LOCKED"
+                row = db.execute(claim_sql).fetchone()
+                if not row:
+                    return None
+                db.execute("""UPDATE gpu_requests SET status='processing',worker_run_id=?,lease_until=?,
+                    attempts=attempts+1,started_at=?,updated_at=? WHERE request_id=? AND status='queued'""",
+                    (worker_run_id, now + lease_seconds, now, now, row["request_id"]))
+                row = db.execute("SELECT * FROM gpu_requests WHERE request_id=?", (row["request_id"],)).fetchone()
+            return dict(row)
+
+    def get_gpu_request(self, request_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM gpu_requests WHERE request_id=?", (request_id,)).fetchone()
+            return dict(row) if row else None
+
+    def complete_gpu_request(self, request_id: str, worker_run_id: str, path: str,
+                             width: int, height: int, elapsed_seconds: float) -> bool:
+        now = time.time()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT status,worker_run_id FROM gpu_requests WHERE request_id=?", (request_id,)).fetchone()
+            if not row:
+                return False
+            if row["status"] == "completed":
+                return True
+            if row["status"] != "processing" or row["worker_run_id"] != worker_run_id:
+                return False
+            db.execute("""UPDATE gpu_requests SET status='completed',image_path=?,image_width=?,image_height=?,
+                elapsed_seconds=?,updated_at=?,finished_at=?,lease_until=NULL,sanitized_error=NULL WHERE request_id=?""",
+                (path, width, height, elapsed_seconds, now, now, request_id))
+        return True
+
+    def fail_gpu_request(self, request_id: str, worker_run_id: str, safe_error: str,
+                         max_attempts: int = 3) -> str | None:
+        now = time.time()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT status,worker_run_id,attempts FROM gpu_requests WHERE request_id=?", (request_id,)).fetchone()
+            if not row or row["status"] == "completed":
+                return None
+            if row["status"] != "processing" or row["worker_run_id"] != worker_run_id:
+                return None
+            status = "failed" if row["attempts"] >= max_attempts else "queued"
+            db.execute("""UPDATE gpu_requests SET status=?,worker_run_id=NULL,lease_until=NULL,updated_at=?,
+                finished_at=?,sanitized_error=? WHERE request_id=?""",
+                (status, now, now if status == "failed" else None,
+                 safe_error if status == "failed" else None, request_id))
+            return status
+
+    def recover_gpu_leases(self, max_attempts: int = 3) -> int:
+        now = time.time()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute("SELECT request_id,attempts FROM gpu_requests WHERE status='processing' AND (lease_until IS NULL OR lease_until<?)", (now,)).fetchall()
+            for row in rows:
+                failed = row["attempts"] >= max_attempts
+                db.execute("""UPDATE gpu_requests SET status=?,worker_run_id=NULL,lease_until=NULL,
+                    updated_at=?,finished_at=?,sanitized_error=? WHERE request_id=?""",
+                    ("failed" if failed else "queued", now, now if failed else None,
+                     "GPU request exhausted retry attempts." if failed else None, row["request_id"]))
+            return len(rows)
+
+    def recover_gpu_run_requests(self, worker_run_id: str, max_attempts: int = 3) -> int:
+        now = time.time()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute("SELECT request_id,attempts FROM gpu_requests WHERE status='processing' AND worker_run_id=?", (worker_run_id,)).fetchall()
+            for row in rows:
+                failed = row["attempts"] >= max_attempts
+                db.execute("""UPDATE gpu_requests SET status=?,worker_run_id=NULL,lease_until=NULL,
+                    updated_at=?,finished_at=?,sanitized_error=? WHERE request_id=?""",
+                    ("failed" if failed else "queued", now, now if failed else None,
+                     "GPU request exhausted retry attempts." if failed else None, row["request_id"]))
+            return len(rows)
+
+    def gpu_run_update(self, dispatch_id: str, state: str, **fields: Any) -> None:
+        allowed = {"worker_run_id", "finished_at", "last_poll_at", "result", "elapsed_seconds"}
+        data = {k: v for k, v in fields.items() if k in allowed}
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            exists = db.execute("SELECT 1 FROM gpu_runs WHERE dispatch_id=?", (dispatch_id,)).fetchone()
+            if exists:
+                sets = ["state=?"] + [f"{key}=?" for key in data]
+                db.execute(f"UPDATE gpu_runs SET {','.join(sets)} WHERE dispatch_id=?", (state, *data.values(), dispatch_id))
+            else:
+                db.execute("INSERT INTO gpu_runs(dispatch_id,state,started_at) VALUES(?,?,?)", (dispatch_id, state, time.time()))
+            db.execute("UPDATE gpu_supervisor SET state=?, active_dispatch_id=COALESCE(?,active_dispatch_id), worker_run_id=COALESCE(?,worker_run_id), heartbeat_at=? WHERE singleton=1",
+                       (state, dispatch_id, data.get("worker_run_id"), time.time()))
+
+    def gpu_supervisor_update(self, **fields: Any) -> None:
+        allowed = {"lease_owner", "lease_until", "heartbeat_at", "worker_heartbeat_at", "state", "active_dispatch_id", "worker_run_id", "kernel_id", "started_at", "last_poll_at", "last_result", "unavailable_reason", "last_error_at"}
+        data = {k: v for k, v in fields.items() if k in allowed}
+        if not data:
+            return
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("UPDATE gpu_supervisor SET " + ",".join(f"{key}=?" for key in data) + " WHERE singleton=1", tuple(data.values()))
+
+    def gpu_supervisor_snapshot(self) -> dict[str, Any]:
+        now = time.time()
+        with self.connect() as db:
+            row = dict(db.execute("SELECT * FROM gpu_supervisor WHERE singleton=1").fetchone())
+            row["queue_depth"] = int(db.execute("SELECT COUNT(*) FROM gpu_requests WHERE status='queued'").fetchone()[0])
+            row["active_requests"] = int(db.execute("SELECT COUNT(*) FROM gpu_requests WHERE status='processing'").fetchone()[0])
+            row["launches_24h"] = int(db.execute("SELECT COUNT(*) FROM gpu_runs WHERE started_at>=?", (now-86400,)).fetchone()[0])
+            row["failed_runs_7d"] = int(db.execute("SELECT COUNT(*) FROM gpu_runs WHERE started_at>=? AND state='failed'", (now-604800,)).fetchone()[0])
+            row["runtime_7d_seconds"] = float(db.execute("SELECT COALESCE(SUM(elapsed_seconds),0) FROM gpu_runs WHERE started_at>=?", (now-604800,)).fetchone()[0])
+            average = db.execute("SELECT AVG(elapsed_seconds) FROM gpu_requests WHERE status='completed' AND elapsed_seconds>0").fetchone()[0]
+            row["average_request_seconds"] = round(float(average), 1) if average is not None else None
+            row["estimated_worker_seconds"] = int((row["queue_depth"] + row["active_requests"]) * float(average)) if average is not None else None
+            row["last_run"] = dict(db.execute("SELECT * FROM gpu_runs ORDER BY started_at DESC LIMIT 1").fetchone() or {})
+            return row
+
+    def claim_gpu_supervisor(self, owner: str, lease_seconds: int = 60) -> bool:
+        now = time.time()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            cur = db.execute("UPDATE gpu_supervisor SET lease_owner=?,lease_until=?,heartbeat_at=? WHERE singleton=1 AND (lease_until IS NULL OR lease_until<? OR lease_owner=?)",
+                             (owner, now+lease_seconds, now, now, owner))
+            return cur.rowcount == 1
+
+    def gpu_callback_started(self, worker_run_id: str, kernel_id: str, started_at: float) -> bool:
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT active_dispatch_id,state,kernel_id,started_at FROM gpu_supervisor WHERE singleton=1").fetchone()
+            if (not row or row["state"] != "starting" or row["kernel_id"] != kernel_id or
+                    not row["active_dispatch_id"] or started_at < float(row["started_at"] or 0) - 5):
+                return False
+            dispatch = row["active_dispatch_id"]
+            db.execute("UPDATE gpu_supervisor SET worker_run_id=?,state='running',started_at=?,heartbeat_at=?,worker_heartbeat_at=?,unavailable_reason=NULL WHERE singleton=1", (worker_run_id, started_at, time.time(), time.time()))
+            db.execute("UPDATE gpu_runs SET worker_run_id=?,state='running' WHERE dispatch_id=?", (worker_run_id, dispatch))
+            return True
+
+    def gpu_callback_heartbeat(self, worker_run_id: str) -> bool:
+        with self.connect() as db:
+            now = time.time()
+            cur = db.execute("UPDATE gpu_supervisor SET heartbeat_at=?,worker_heartbeat_at=? WHERE singleton=1 AND worker_run_id=? AND state IN ('running','exiting')", (now, now, worker_run_id))
+            return cur.rowcount == 1
+
+    def gpu_callback_exiting(self, worker_run_id: str, reason: str, elapsed: float, max_attempts: int = 3) -> bool:
+        now = time.time()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT active_dispatch_id FROM gpu_supervisor WHERE singleton=1 AND worker_run_id=?", (worker_run_id,)).fetchone()
+            if not row:
+                return False
+            dispatch = row[0]
+            result = "completed" if reason in {"idle", "max_runtime"} else "failed"
+            db.execute("UPDATE gpu_runs SET state='exiting',result=?,elapsed_seconds=? WHERE dispatch_id=?", (reason[:80], elapsed, dispatch))
+            pending = db.execute("SELECT request_id,attempts FROM gpu_requests WHERE status='processing' AND worker_run_id=?", (worker_run_id,)).fetchall()
+            for item in pending:
+                failed = item["attempts"] >= max_attempts
+                db.execute("UPDATE gpu_requests SET status=?,worker_run_id=NULL,lease_until=NULL,updated_at=?,finished_at=?,sanitized_error=? WHERE request_id=?",
+                    ("failed" if failed else "queued", now, now if failed else None,
+                     "GPU request exhausted retry attempts." if failed else None, item["request_id"]))
+            db.execute("UPDATE gpu_supervisor SET state='exiting',last_result=?,heartbeat_at=?,unavailable_reason=NULL WHERE singleton=1", (result, now))
+            return True
+
+    def queue_stats(self) -> dict[str, int]:
+        with self.connect() as db:
+            rows = db.execute("SELECT status,COUNT(*) AS n FROM jobs GROUP BY status").fetchall()
+            counts = {row["status"]: int(row["n"]) for row in rows}
+            return {"queued": counts.get("QUEUED", 0), "processing": counts.get("PROCESSING", 0)}
+
+    def queue_position(self, task_id: str) -> int | None:
+        with self.connect() as db:
+            row = db.execute("SELECT queue_order FROM jobs WHERE task_id=? AND status='QUEUED'", (task_id,)).fetchone()
+            if not row:
+                return None
+            position = db.execute("SELECT COUNT(*) FROM jobs WHERE status='QUEUED' AND queue_order<=?",
+                                  (row["queue_order"],)).fetchone()[0]
+            return int(position)
+
+    def next_available_delay(self, default: float = 1.0) -> float:
+        with self.connect() as db:
+            row = db.execute("SELECT MIN(available_at) FROM jobs WHERE status='QUEUED'").fetchone()
+            if row[0] is None:
+                return default
+            return max(0.1, min(default, float(row[0]) - time.time()))
+
+    def create_user(self, email: str, password_hash: str) -> int | None:
+        try:
+            with self.connect() as db:
+                if self.use_postgres:
+                    row = db.execute(
+                        "INSERT INTO users(email, password_hash, created_at) VALUES (?, ?, ?) RETURNING id",
+                        (email.strip().lower(), password_hash, time.time()),
+                    ).fetchone()
+                    return int(row["id"])
+                cursor = db.execute("INSERT INTO users(email, password_hash, created_at) VALUES (?, ?, ?)",
+                                    (email, password_hash, time.time()))
+                return int(cursor.lastrowid)
+        except sqlite3.IntegrityError:
+            return None
+        except Exception as exc:
+            if pg_errors and isinstance(exc, pg_errors.UniqueViolation):
+                return None
+            raise
+
+    def get_user_by_email(self, email: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            lookup = email.strip().lower() if self.use_postgres else email
+            row = db.execute("SELECT id, email, password_hash FROM users WHERE email = ?", (lookup,)).fetchone()
+            return dict(row) if row else None
+
+    def get_user_by_id(self, user_id: int) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute("SELECT id, email FROM users WHERE id = ?", (user_id,)).fetchone()
+            return dict(row) if row else None
+
+    def save_project(self, job_id: str, user_id: int, state: dict[str, Any]) -> None:
+        serialized = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
+        created_at = float(state.get("created_at", time.time()))
+        updated_at = float(state.get("updated_at", created_at))
+        with self.connect() as db:
+            db.execute("""
+                INSERT INTO projects(id, user_id, state_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    state_json = excluded.state_json,
+                    updated_at = excluded.updated_at
+                WHERE projects.user_id = excluded.user_id
+            """, (job_id, user_id, serialized, created_at, updated_at))
+
+    def load_projects(self) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute("SELECT state_json FROM projects ORDER BY created_at").fetchall()
+            return [json.loads(row["state_json"]) for row in rows]
+
+    def list_projects(self, user_id: int) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT state_json FROM projects WHERE user_id = ? ORDER BY created_at DESC",
+                (user_id,),
+            ).fetchall()
+            return [json.loads(row["state_json"]) for row in rows]
+
+    def delete_project(self, job_id: str, user_id: int) -> None:
+        """Remove a project record that could not be accepted into the queue."""
+        with self.connect() as db:
+            db.execute("DELETE FROM projects WHERE id = ? AND user_id = ?", (job_id, user_id))
+
+    def recent_login_attempts(self, identity_hash: str, since: float) -> int:
+        with self.connect() as db:
+            db.execute("DELETE FROM login_attempts WHERE attempted_at < ?", (since - 86400,))
+            row = db.execute(
+                "SELECT COUNT(*) AS total FROM login_attempts WHERE identity_hash = ? AND attempted_at >= ?",
+                (identity_hash, since),
+            ).fetchone()
+            return int(row["total"])
+
+    def record_login_attempt(self, identity_hash: str, attempted_at: float) -> None:
+        with self.connect() as db:
+            db.execute(
+                "INSERT INTO login_attempts(identity_hash, attempted_at) VALUES (?, ?)",
+                (identity_hash, attempted_at),
+            )
+
+    def clear_login_attempts(self, identity_hash: str) -> None:
+        with self.connect() as db:
+            db.execute("DELETE FROM login_attempts WHERE identity_hash = ?", (identity_hash,))
