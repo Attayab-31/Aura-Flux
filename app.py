@@ -255,8 +255,8 @@ def admin_register():
     if g.current_user:
         return redirect(url_for("admin_panel") if g.current_user.get("role") == "admin" else url_for("index"))
     error = None
-    if not ADMIN_REGISTRATION_CODE or len(ADMIN_REGISTRATION_CODE) < 32:
-        error = "Admin registration is not configured. Ask the workspace owner to configure the admin code."
+    if not ADMIN_REGISTRATION_CODE or len(ADMIN_REGISTRATION_CODE) < 8:
+        error = "Admin setup is not ready. Ask the workspace owner to set an admin code with at least 8 characters."
     elif not auth_store.admin_bootstrap_available():
         error = "The one-time admin registration has already been used."
     elif request.method == "POST":
