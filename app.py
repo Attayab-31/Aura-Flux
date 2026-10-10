@@ -31,7 +31,7 @@ from flask import Flask, render_template, request, jsonify, send_from_directory,
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from config import (
-    BASE_DIR, EXPORTS_DIR, TEMP_DIR, INSTANCE_DIR, SECRET_KEY, MAX_CONTENT_LENGTH,
+    TEMP_DIR, SECRET_KEY, MAX_CONTENT_LENGTH,
     DEEPGRAM_API_KEY, LLM_PROVIDER,
     KAGGLE_BATCH_AUTOSTART, KAGGLE_KERNEL_ID, KAGGLE_BATCH_IDLE_EXIT_SECONDS,
     KAGGLE_BATCH_MAX_RUNTIME_SECONDS, KAGGLE_BATCH_MAX_RUNTIME_PER_WEEK_SECONDS,
@@ -51,8 +51,7 @@ from services.image_client import configure_batch_request_manager
 from services.auth_store import AuthStore
 from services.kaggle_batch_dispatcher import KaggleBatchDispatcher
 from services.gpu_request_client import KaggleBatchGpuClient
-from services.object_storage import (create_signed_url, download_file,
-    is_configured as object_storage_configured, upload_file)
+from services.object_storage import create_signed_url, download_file, upload_file
 from PIL import Image, UnidentifiedImageError
 import io
 
@@ -69,16 +68,16 @@ app.config["SECRET_KEY"] = SECRET_KEY
 app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
-app.config["SESSION_COOKIE_SECURE"] = os.getenv("SESSION_COOKIE_SECURE", "false").lower() == "true"
+app.config["SESSION_COOKIE_SECURE"] = True
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=14)
 
-auth_store = AuthStore(INSTANCE_DIR / "studio.sqlite3")
+auth_store = AuthStore()
 gpu_dispatcher = KaggleBatchDispatcher(auth_store)
 gpu_client = KaggleBatchGpuClient(auth_store, gpu_dispatcher)
 configure_batch_request_manager(gpu_client)
 DUMMY_PASSWORD_HASH = generate_password_hash(secrets.token_urlsafe(32), method="scrypt:32768:8:1")
 
-# SQLite stores queued tasks. This in-memory event only wakes the consumer.
+# PostgreSQL stores queued tasks. This in-memory event only wakes the consumer.
 MAX_PENDING_JOBS = 100
 JOBS_LOCK = threading.Lock()
 JOBS: Dict[str, Dict[str, Any]] = {}
@@ -364,10 +363,11 @@ def run_video_generation_pipeline(job_id: str, params: Dict[str, Any]) -> None:
             scene["audio_duration"] = aud_dur
             scene["audio_ready"] = True
             scene["audio_url"] = f"/temp/{job_id}/audio/{audio_file.name}"
-            if object_storage_configured():
-                owner_id = (auth_store.get_job(job_id) or {}).get("owner_id")
-                scene["audio_storage_key"] = f"media/{int(owner_id)}/{job_id}/audio/{audio_file.name}"
-                upload_file(scene["audio_storage_key"], audio_file, "audio/mpeg")
+            owner_id = (auth_store.get_job(job_id) or {}).get("owner_id")
+            if not owner_id:
+                raise RuntimeError("Could not resolve media owner for Supabase Storage.")
+            scene["audio_storage_key"] = f"media/{int(owner_id)}/{job_id}/audio/{audio_file.name}"
+            upload_file(scene["audio_storage_key"], audio_file, "audio/mpeg")
             total_audio_duration += aud_dur
 
             progress = 20 + int((i + 1) / num_scenes * 20)
@@ -430,10 +430,8 @@ def run_video_generation_pipeline(job_id: str, params: Dict[str, Any]) -> None:
                 gpu_record = auth_store.get_gpu_request(gpu_request["request_id"])
                 if gpu_record and str(gpu_record.get("image_path") or "").startswith("supabase://"):
                     scene["image_storage_key"] = gpu_record["image_path"][len("supabase://"):]
-                elif object_storage_configured():
-                    owner_id = (auth_store.get_job(job_id) or {}).get("owner_id")
-                    scene["image_storage_key"] = f"media/{int(owner_id)}/{job_id}/images/{img_file.name}"
-                    upload_file(scene["image_storage_key"], img_file, "image/png")
+                else:
+                    raise RuntimeError("Kaggle worker completed an image without storing it in Supabase.")
                 progress = 40 + int((sum(1 for s in scenes if s.get("image_ready")) / num_scenes) * 30)
                 update_job_state(job_id, progress_percent=progress, scenes=scenes,
                     step_description=f"Rendered generative frame {n}/{len(image_batch)} in the batch.")
@@ -450,7 +448,9 @@ def run_video_generation_pipeline(job_id: str, params: Dict[str, Any]) -> None:
         )
         log_job_message(job_id, "Stage 4 & 5: Applying Ken Burns transforms, crossfade transitions, and H.264 encode...")
 
-        output_filename = EXPORTS_DIR / f"video_{job_id}.mp4"
+        output_dir = TEMP_DIR / job_id / "exports"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_filename = output_dir / f"video_{job_id}.mp4"
 
         def video_progress_cb(pct: float, desc: str) -> None:
             # Map composer progress (0-100) to overall pipeline progress (70-98)
@@ -469,13 +469,11 @@ def run_video_generation_pipeline(job_id: str, params: Dict[str, Any]) -> None:
 
         total_elapsed = round(time.time() - start_time, 1)
         video_rel_url = f"/exports/{job_id}/{Path(rendered_mp4).name}"
-        video_storage_key = None
-        if object_storage_configured():
-            owner_id = (auth_store.get_job(job_id) or {}).get("owner_id")
-            if not owner_id:
-                raise RuntimeError("Could not resolve media owner for persistent storage.")
-            video_storage_key = f"videos/{int(owner_id)}/{job_id}/{Path(rendered_mp4).name}"
-            upload_file(video_storage_key, rendered_mp4, "video/mp4")
+        owner_id = (auth_store.get_job(job_id) or {}).get("owner_id")
+        if not owner_id:
+            raise RuntimeError("Could not resolve media owner for Supabase Storage.")
+        video_storage_key = f"videos/{int(owner_id)}/{job_id}/{Path(rendered_mp4).name}"
+        upload_file(video_storage_key, rendered_mp4, "video/mp4")
 
         update_job_state(
             job_id,
@@ -515,7 +513,6 @@ def run_image_generation_task(job_id: str, params: Dict[str, Any]) -> None:
                      stage="Generating image", step_description="Sending prompt to image worker...")
     job = auth_store.get_job(job_id) or {}
     fetch_scene_image(
-        worker_url=None,
         prompt=params["prompt"],
         width=params["width"],
         height=params["height"],
@@ -528,9 +525,8 @@ def run_image_generation_task(job_id: str, params: Dict[str, Any]) -> None:
     with Image.open(image_path) as image:
         actual_width, actual_height = image.size
     image_storage_key = None
-    if object_storage_configured():
-        image_storage_key = f"media/{int(job['owner_id'])}/{job_id}/images/result.png"
-        upload_file(image_storage_key, image_path, "image/png")
+    image_storage_key = f"media/{int(job['owner_id'])}/{job_id}/images/result.png"
+    upload_file(image_storage_key, image_path, "image/png")
     update_job_state(job_id, status="COMPLETED", progress_percent=100,
                      stage="Completed", step_description="Image generation completed.",
                      image_path=str(image_path), width=actual_width,
@@ -538,8 +534,8 @@ def run_image_generation_task(job_id: str, params: Dict[str, Any]) -> None:
 
 
 def _acquire_consumer_lock():
-    """Acquire a cross-process singleton lock for the durable queue consumer."""
-    lock_path = INSTANCE_DIR / "job-consumer.lock"
+    """Acquire a Linux file lock so only one queue consumer runs at a time."""
+    lock_path = TEMP_DIR / ".job-consumer.lock"
     handle = open(lock_path, "a+b")
     handle.seek(0, os.SEEK_END)
     if handle.tell() == 0:
@@ -547,12 +543,8 @@ def _acquire_consumer_lock():
         handle.flush()
     handle.seek(0)
     try:
-        if os.name == "nt":
-            import msvcrt
-            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        import fcntl
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         return handle
     except (OSError, BlockingIOError):
         handle.close()
@@ -667,21 +659,14 @@ def _durable_queue_consumer() -> None:
             QUEUE_WAKE.clear()
 
 
-def _start_queue_worker(force: bool = False) -> bool:
-    """Start at most one consumer, respecting the Flask debug reloader."""
+def _start_queue_worker() -> bool:
+    """Start one PostgreSQL-backed queue consumer in this web process."""
     global CONSUMER_THREAD
-    if not force:
-        if os.getenv("DISABLE_JOB_CONSUMER", "false").lower() == "true":
-            return False
-        debug_reloader_parent = (os.getenv("FLASK_DEBUG", "false").lower() == "true"
-                                 and os.getenv("WERKZEUG_RUN_MAIN", "").lower() != "true")
-        if debug_reloader_parent:
-            return False
     with CONSUMER_START_LOCK:
         if CONSUMER_THREAD and CONSUMER_THREAD.is_alive():
             return True
         CONSUMER_THREAD = threading.Thread(target=_durable_queue_consumer,
-                                           name="SQLiteJobConsumer", daemon=True)
+                                           name="PostgresJobConsumer", daemon=True)
         CONSUMER_THREAD.start()
         return True
 
@@ -1031,11 +1016,9 @@ def internal_gpu_complete(request_id):
     try:
         partial.write_bytes(raw)
         partial.replace(target)
-        image_path_for_db = str(target)
-        if object_storage_configured():
-            storage_key = f"gpu/{int(row['user_id'])}/{row['parent_task_id']}/{request_id}.png"
-            upload_file(storage_key, target, "image/png")
-            image_path_for_db = f"supabase://{storage_key}"
+        storage_key = f"gpu/{int(row['user_id'])}/{row['parent_task_id']}/{request_id}.png"
+        upload_file(storage_key, target, "image/png")
+        image_path_for_db = f"supabase://{storage_key}"
         try:
             elapsed = max(0.0, min(86400.0, float(payload.get("elapsed_seconds", 0))))
         except (TypeError, ValueError):
@@ -1113,9 +1096,8 @@ def get_job_status(job_id: str):
         scene.pop("audio_path", None)
         scene.pop("image_storage_key", None)
         scene.pop("audio_storage_key", None)
-    for worker_token in (os.getenv("KAGGLE_WORKER_TOKEN", ""), WORKER_CALLBACK_TOKEN):
-        if worker_token:
-            result["logs"] = [str(line).replace(worker_token, "[redacted]") for line in result.get("logs", [])]
+    if WORKER_CALLBACK_TOKEN:
+        result["logs"] = [str(line).replace(WORKER_CALLBACK_TOKEN, "[redacted]") for line in result.get("logs", [])]
     if request.path.startswith("/status/"):
         result["status"] = {
             "QUEUED": "queued",
@@ -1229,7 +1211,7 @@ def serve_export(job_id: str, filename: str):
         except Exception:
             logger.exception("Could not create private video URL for job %s", job_id)
             return jsonify({"error": "Video is temporarily unavailable."}), 503
-    return send_from_directory(EXPORTS_DIR, filename, mimetype="video/mp4")
+    return jsonify({"error": "Video is not available in Supabase Storage."}), 404
 
 
 @app.route("/temp/<job_id>/images/<path:filename>")
@@ -1280,13 +1262,3 @@ def serve_temp_audio(job_id: str, filename: str):
 
 gpu_dispatcher.start()
 _start_queue_worker()
-
-
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5000"))
-    debug_mode = os.getenv("FLASK_DEBUG", "false").lower() == "true"
-    print(f"\n=======================================================")
-    print(f"🎬 AI VIDEO GENERATION CONTROL PLANE RUNNING")
-    print(f"🌐 Access Web Dashboard: http://localhost:{port}")
-    print(f"=======================================================\n")
-    app.run(host="0.0.0.0", port=port, debug=debug_mode)

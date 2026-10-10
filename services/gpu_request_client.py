@@ -50,11 +50,12 @@ class KaggleBatchGpuClient:
             if not row:
                 raise RuntimeError("GPU request is unavailable.")
             if row["status"] == "completed":
-                path = Path(row["image_path"] or row["output_key"])
-                if str(row.get("image_path") or "").startswith("supabase://"):
-                    key = str(row["image_path"])[len("supabase://"):]
-                    download_file(key, row["output_key"])
-                    path = Path(row["output_key"])
+                stored_path = str(row.get("image_path") or "")
+                if not stored_path.startswith("supabase://"):
+                    raise RuntimeError("Completed GPU image is missing its Supabase Storage reference.")
+                key = stored_path[len("supabase://"):]
+                download_file(key, row["output_key"])
+                path = Path(row["output_key"])
                 if not path.is_file():
                     raise RuntimeError("GPU image output is missing.")
                 return str(path)

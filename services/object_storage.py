@@ -1,28 +1,15 @@
 """Private Supabase Storage access for generated user media."""
 
-import os
 from pathlib import Path
 from urllib.parse import quote
 
 import requests
 
-
-def is_configured() -> bool:
-    return bool(os.getenv("SUPABASE_URL", "").strip() and
-                os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip())
+from config import SUPABASE_SERVICE_ROLE_KEY, SUPABASE_STORAGE_BUCKET, SUPABASE_URL
 
 
 def _settings():
-    base = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
-    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
-    bucket = os.getenv("SUPABASE_STORAGE_BUCKET", "fluxstory-media").strip()
-    if not base or not key:
-        raise RuntimeError("Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY for persistent media storage.")
-    return base, key, bucket
-
-
-if os.getenv("RENDER", "").lower() == "true" and not is_configured():
-    raise RuntimeError("Configure SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in Render; local media is ephemeral.")
+    return SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_STORAGE_BUCKET
 
 
 def _object_url(base: str, bucket: str, key: str) -> str:

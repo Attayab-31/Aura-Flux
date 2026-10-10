@@ -8,10 +8,6 @@ services:
     envVars:
       - key: SECRET_KEY
         generateValue: true
-      - key: SESSION_COOKIE_SECURE
-        value: "true"
-      - key: FLASK_DEBUG
-        value: "false"
       - key: SUPABASE_DB_URL
         sync: false
       - key: SUPABASE_URL

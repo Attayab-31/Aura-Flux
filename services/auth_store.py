@@ -1,25 +1,19 @@
-"""SQLite persistence for accounts, projects, login throttling, and durable jobs."""
+"""Supabase PostgreSQL persistence for accounts, projects, and durable jobs."""
 
 import json
-import os
-import sqlite3
 import time
 from contextlib import contextmanager
-from pathlib import Path
 from typing import Any
 
-try:
-    import psycopg
-    from psycopg import errors as pg_errors
-    from psycopg.rows import dict_row
-except ImportError:  # PostgreSQL driver is installed for deployments.
-    psycopg = None
-    pg_errors = None
-    dict_row = None
+import psycopg
+from psycopg import errors as pg_errors
+from psycopg.rows import dict_row
+
+from config import SUPABASE_DB_URL
 
 
 class _Record(dict):
-    """Small SQLite-row compatible mapping for psycopg results."""
+    """Mapping that supports named and positional field access."""
     def __init__(self, mapping):
         super().__init__(mapping)
         self._keys = list(mapping)
@@ -37,18 +31,9 @@ class _PostgresConnection:
     def execute(self, sql, params=()):
         sql = sql.strip()
         if sql.upper() == "BEGIN IMMEDIATE":
-            # Preserve SQLite's serialized write-section semantics for bounded
-            # queue capacity checks and multi-row state transitions.
+            # Serialize queue mutations across app workers and replicas.
             return _PostgresCursor(self.connection.execute("SELECT pg_advisory_xact_lock(91384017)"))
-        ignored = sql.upper().startswith("PRAGMA ")
-        if ignored:
-            return _PostgresCursor(self.connection.execute("SELECT 1"))
-        ignore_insert = sql.upper().startswith("INSERT OR IGNORE INTO ")
-        if ignore_insert:
-            sql = sql.replace("INSERT OR IGNORE INTO", "INSERT INTO", 1)
         sql = sql.replace("?", "%s")
-        if ignore_insert:
-            sql += " ON CONFLICT DO NOTHING"
         return _PostgresCursor(self.connection.execute(sql, params))
 
     def executescript(self, sql):
@@ -80,28 +65,15 @@ class _PostgresCursor:
 
 
 class AuthStore:
-    def __init__(self, database_path: Path):
-        self.database_url = os.getenv("SUPABASE_DB_URL", "").strip() or os.getenv("DATABASE_URL", "").strip()
-        self.use_postgres = bool(self.database_url)
-        if os.getenv("RENDER", "").lower() == "true" and not self.use_postgres:
-            raise RuntimeError("Configure SUPABASE_DB_URL in Render; SQLite is not durable on a free Render service.")
-        if self.use_postgres and psycopg is None:
-            raise RuntimeError("Install psycopg[binary] to use SUPABASE_DB_URL or DATABASE_URL.")
-        self.database_path = Path(database_path)
-        if not self.use_postgres:
-            self.database_path.parent.mkdir(parents=True, exist_ok=True)
+    def __init__(self):
+        self.database_url = SUPABASE_DB_URL
         self.initialize()
 
     @contextmanager
     def connect(self):
-        if self.use_postgres:
-            raw = psycopg.connect(self.database_url, connect_timeout=10,
-                                  prepare_threshold=None, sslmode="require", row_factory=dict_row)
-            connection = _PostgresConnection(raw)
-        else:
-            connection = sqlite3.connect(self.database_path, timeout=15)
-            connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA foreign_keys = ON")
+        raw = psycopg.connect(self.database_url, connect_timeout=10,
+                              prepare_threshold=None, sslmode="require", row_factory=dict_row)
+        connection = _PostgresConnection(raw)
         try:
             yield connection
             connection.commit()
@@ -112,131 +84,7 @@ class AuthStore:
             connection.close()
 
     def initialize(self) -> None:
-        if self.use_postgres:
-            self._initialize_postgres()
-            return
-        with self.connect() as db:
-            db.execute("PRAGMA journal_mode = WAL")
-            db.executescript("""
-                CREATE TABLE IF NOT EXISTS users (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    email TEXT NOT NULL COLLATE NOCASE UNIQUE,
-                    password_hash TEXT NOT NULL,
-                    created_at REAL NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS projects (
-                    id TEXT PRIMARY KEY,
-                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    state_json TEXT NOT NULL,
-                    created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS projects_owner_updated
-                    ON projects(user_id, updated_at DESC);
-                CREATE TABLE IF NOT EXISTS jobs (
-                    queue_order INTEGER PRIMARY KEY AUTOINCREMENT,
-                    task_id TEXT NOT NULL UNIQUE,
-                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    task_type TEXT NOT NULL,
-                    options_json TEXT NOT NULL,
-                    state_json TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    progress_percent INTEGER NOT NULL DEFAULT 0,
-                    stage TEXT NOT NULL DEFAULT 'Queued',
-                    step_description TEXT NOT NULL DEFAULT '',
-                    created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL,
-                    started_at REAL,
-                    finished_at REAL,
-                    attempt_count INTEGER NOT NULL DEFAULT 0,
-                    lease_owner TEXT,
-                    lease_until REAL,
-                    available_at REAL NOT NULL DEFAULT 0,
-                    output_json TEXT NOT NULL DEFAULT '{}',
-                    sanitized_error TEXT
-                );
-                CREATE INDEX IF NOT EXISTS jobs_queue_order
-                    ON jobs(status, available_at, queue_order);
-                CREATE INDEX IF NOT EXISTS jobs_owner_created
-                    ON jobs(user_id, created_at DESC);
-                CREATE TABLE IF NOT EXISTS gpu_requests (
-                    enqueue_order INTEGER PRIMARY KEY AUTOINCREMENT,
-                    request_id TEXT NOT NULL UNIQUE,
-                    parent_task_id TEXT NOT NULL,
-                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    request_type TEXT NOT NULL DEFAULT 'image',
-                    prompt TEXT NOT NULL,
-                    width INTEGER NOT NULL,
-                    height INTEGER NOT NULL,
-                    seed INTEGER,
-                    strength REAL NOT NULL DEFAULT 1.0,
-                    reference_image_path TEXT,
-                    output_key TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'queued',
-                    attempts INTEGER NOT NULL DEFAULT 0,
-                    worker_run_id TEXT,
-                    lease_until REAL,
-                    created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL,
-                    started_at REAL,
-                    finished_at REAL,
-                    image_path TEXT,
-                    image_width INTEGER,
-                    image_height INTEGER,
-                    elapsed_seconds REAL,
-                    sanitized_error TEXT
-                );
-                CREATE INDEX IF NOT EXISTS gpu_queue_order ON gpu_requests(status, enqueue_order);
-                CREATE INDEX IF NOT EXISTS gpu_owner_parent ON gpu_requests(user_id,parent_task_id);
-                CREATE TABLE IF NOT EXISTS gpu_supervisor (
-                    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-                    lease_owner TEXT,
-                    lease_until REAL,
-                    heartbeat_at REAL,
-                    worker_heartbeat_at REAL,
-                    state TEXT NOT NULL DEFAULT 'idle',
-                    active_dispatch_id TEXT,
-                    worker_run_id TEXT,
-                    kernel_id TEXT,
-                    started_at REAL,
-                    last_poll_at REAL,
-                    last_result TEXT,
-                    unavailable_reason TEXT,
-                    last_error_at REAL
-                );
-                INSERT OR IGNORE INTO gpu_supervisor(singleton,state) VALUES(1,'idle');
-                CREATE TABLE IF NOT EXISTS gpu_runs (
-                    dispatch_id TEXT PRIMARY KEY,
-                    worker_run_id TEXT,
-                    state TEXT NOT NULL,
-                    started_at REAL NOT NULL,
-                    finished_at REAL,
-                    last_poll_at REAL,
-                    result TEXT,
-                    elapsed_seconds REAL NOT NULL DEFAULT 0
-                );
-                CREATE TABLE IF NOT EXISTS login_attempts (
-                    identity_hash TEXT NOT NULL,
-                    attempted_at REAL NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS login_attempts_recent
-                    ON login_attempts(identity_hash, attempted_at);
-            """)
-            columns = {row["name"] for row in db.execute("PRAGMA table_info(jobs)").fetchall()}
-            if "started_at" not in columns:
-                db.execute("ALTER TABLE jobs ADD COLUMN started_at REAL")
-            if "finished_at" not in columns:
-                db.execute("ALTER TABLE jobs ADD COLUMN finished_at REAL")
-            supervisor_columns = {row["name"] for row in db.execute("PRAGMA table_info(gpu_supervisor)").fetchall()}
-            if "worker_heartbeat_at" not in supervisor_columns:
-                db.execute("ALTER TABLE gpu_supervisor ADD COLUMN worker_heartbeat_at REAL")
-            gpu_columns = {row["name"] for row in db.execute("PRAGMA table_info(gpu_requests)").fetchall()}
-            if "reference_image_path" not in gpu_columns:
-                db.execute("ALTER TABLE gpu_requests ADD COLUMN reference_image_path TEXT")
-        self.migrate_legacy_projects()
-
-    def _initialize_postgres(self) -> None:
-        """Create the same durable queue schema on Supabase PostgreSQL."""
+        """Create the Supabase PostgreSQL schema if it does not exist."""
         schema = """
         CREATE TABLE IF NOT EXISTS users (
             id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
@@ -301,7 +149,7 @@ class AuthStore:
         self.migrate_legacy_projects()
 
     def migrate_legacy_projects(self) -> None:
-        """Make existing SQLite project records visible to the durable queue."""
+        """Ensure prior project records also have a durable queue record."""
         with self.connect() as db:
             rows = db.execute("SELECT id, user_id, state_json FROM projects ORDER BY created_at, id").fetchall()
             for row in rows:
@@ -332,11 +180,11 @@ class AuthStore:
                 created_at = float(state.get("created_at", time.time()))
                 updated_at = float(state.get("updated_at", created_at))
                 db.execute("""
-                    INSERT OR IGNORE INTO jobs
+                    INSERT INTO jobs
                     (task_id,user_id,task_type,options_json,state_json,status,progress_percent,
                      stage,step_description,created_at,updated_at,started_at,finished_at,
                      available_at,output_json,sanitized_error)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING
                 """, (row["id"], row["user_id"], task_type,
                       json.dumps(options, ensure_ascii=False), json.dumps(state, ensure_ascii=False),
                       status, int(state.get("progress_percent", 0)), str(state.get("stage", "Queued")),
@@ -412,8 +260,7 @@ class AuthStore:
                 SELECT task_id,state_json,attempt_count FROM jobs
                 WHERE status='PROCESSING' AND lease_until < ? ORDER BY queue_order
             """
-            if self.use_postgres:
-                expired_sql += " FOR UPDATE SKIP LOCKED"
+            expired_sql += " FOR UPDATE SKIP LOCKED"
             expired = db.execute(expired_sql, (now,)).fetchall()
             for row in expired:
                 state = json.loads(row["state_json"])
@@ -440,8 +287,7 @@ class AuthStore:
                 SELECT task_id,state_json,attempt_count FROM jobs
                 WHERE status='QUEUED' AND available_at<=? ORDER BY queue_order LIMIT 1
             """
-            if self.use_postgres:
-                claim_sql += " FOR UPDATE SKIP LOCKED"
+            claim_sql += " FOR UPDATE SKIP LOCKED"
             row = db.execute(claim_sql, (now,)).fetchone()
             if row is None:
                 return None
@@ -558,10 +404,10 @@ class AuthStore:
                     raise ValueError("GPU image strength is invalid")
                 rid = str(item["request_id"])
                 ids.append(rid)
-                db.execute("""INSERT OR IGNORE INTO gpu_requests
+                db.execute("""INSERT INTO gpu_requests
                     (request_id,parent_task_id,user_id,request_type,prompt,width,height,seed,strength,reference_image_path,
                      output_key,status,created_at,updated_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,'queued',?,?)""",
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,'queued',?,?) ON CONFLICT DO NOTHING""",
                     (rid, item["parent_task_id"], item["user_id"], item.get("request_type", "image"),
                      prompt.strip(), width, height, seed, strength, item.get("reference_image_path"), item["output_key"], now, now))
         return ids
@@ -577,8 +423,7 @@ class AuthStore:
             row = db.execute("SELECT * FROM gpu_requests WHERE status='processing' AND worker_run_id=? ORDER BY enqueue_order LIMIT 1", (worker_run_id,)).fetchone()
             if not row:
                 claim_sql = "SELECT * FROM gpu_requests WHERE status='queued' ORDER BY enqueue_order LIMIT 1"
-                if self.use_postgres:
-                    claim_sql += " FOR UPDATE SKIP LOCKED"
+                claim_sql += " FOR UPDATE SKIP LOCKED"
                 row = db.execute(claim_sql).fetchone()
                 if not row:
                     return None
@@ -761,25 +606,19 @@ class AuthStore:
     def create_user(self, email: str, password_hash: str) -> int | None:
         try:
             with self.connect() as db:
-                if self.use_postgres:
-                    row = db.execute(
-                        "INSERT INTO users(email, password_hash, created_at) VALUES (?, ?, ?) RETURNING id",
-                        (email.strip().lower(), password_hash, time.time()),
-                    ).fetchone()
-                    return int(row["id"])
-                cursor = db.execute("INSERT INTO users(email, password_hash, created_at) VALUES (?, ?, ?)",
-                                    (email, password_hash, time.time()))
-                return int(cursor.lastrowid)
-        except sqlite3.IntegrityError:
-            return None
+                row = db.execute(
+                    "INSERT INTO users(email, password_hash, created_at) VALUES (?, ?, ?) RETURNING id",
+                    (email.strip().lower(), password_hash, time.time()),
+                ).fetchone()
+                return int(row["id"])
         except Exception as exc:
-            if pg_errors and isinstance(exc, pg_errors.UniqueViolation):
+            if isinstance(exc, pg_errors.UniqueViolation):
                 return None
             raise
 
     def get_user_by_email(self, email: str) -> dict[str, Any] | None:
         with self.connect() as db:
-            lookup = email.strip().lower() if self.use_postgres else email
+            lookup = email.strip().lower()
             row = db.execute("SELECT id, email, password_hash FROM users WHERE email = ?", (lookup,)).fetchone()
             return dict(row) if row else None
 

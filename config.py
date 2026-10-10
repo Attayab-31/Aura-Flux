@@ -6,45 +6,32 @@ Central Configuration and Path Management for AI Video Generation Control Plane
 """
 
 import os
-import shutil
 from pathlib import Path
-from dotenv import load_dotenv
-
-# Load environment variables from .env if present
-load_dotenv()
 
 # Base project paths
 BASE_DIR = Path(__file__).resolve().parent
-STATIC_DIR = BASE_DIR / "static"
-TEMPLATES_DIR = BASE_DIR / "templates"
+# Local disk is scratch space for active media rendering only; durable data lives
+# in Supabase PostgreSQL and Storage.
 TEMP_DIR = BASE_DIR / "temp"
-_persistent_data_env = os.getenv("PERSISTENT_DATA_DIR", "").strip()
-INSTANCE_DIR = Path(_persistent_data_env or (BASE_DIR / "instance")).resolve()
-TEMP_DIR = Path(os.getenv("PERSISTENT_TEMP_DIR", str(INSTANCE_DIR / "temp" if _persistent_data_env else BASE_DIR / "temp"))).resolve()
-INSTANCE_DIR.mkdir(parents=True, exist_ok=True)
-
-# Private, durable project storage (served only through authenticated routes).
-EXPORTS_DIR = INSTANCE_DIR / "exports"
-LEGACY_EXPORTS_DIR = STATIC_DIR / "exports"
-EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
-if LEGACY_EXPORTS_DIR.is_dir():
-    for legacy_export in LEGACY_EXPORTS_DIR.glob("video_*.mp4"):
-        private_export = EXPORTS_DIR / legacy_export.name
-        if not private_export.exists():
-            shutil.move(str(legacy_export), str(private_export))
-TEMP_AUDIO_DIR = TEMP_DIR / "audio"
-TEMP_IMAGES_DIR = TEMP_DIR / "images"
-TEMP_CLIPS_DIR = TEMP_DIR / "clips"
-
-# Ensure all critical workspace directories exist
-for directory in (EXPORTS_DIR, TEMP_AUDIO_DIR, TEMP_IMAGES_DIR, TEMP_CLIPS_DIR):
-    directory.mkdir(parents=True, exist_ok=True)
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 # Flask application settings
 SECRET_KEY = os.getenv("SECRET_KEY", "")
 if len(SECRET_KEY) < 32 or SECRET_KEY.startswith("change-this"):
-    raise RuntimeError("Set SECRET_KEY to a random value of at least 32 characters in the process environment or .env.")
+    raise RuntimeError("Set SECRET_KEY to a random value of at least 32 characters in Render environment settings.")
 MAX_CONTENT_LENGTH = 64 * 1024 * 1024  # 64 MB
+
+# Supabase is the only supported persistence backend.
+SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL", "").strip()
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+SUPABASE_STORAGE_BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET", "fluxstory-media").strip()
+if not SUPABASE_DB_URL:
+    raise RuntimeError("Set SUPABASE_DB_URL to the Supabase PostgreSQL session-pooler connection string.")
+if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+    raise RuntimeError("Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY for private media storage.")
+if not SUPABASE_STORAGE_BUCKET:
+    raise RuntimeError("Set SUPABASE_STORAGE_BUCKET to the private media bucket name.")
 
 # API Defaults and Environment Keys
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -54,20 +41,12 @@ CUSTOM_LLM_API_KEY = os.getenv("CUSTOM_LLM_API_KEY", "")
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai").lower()
 CUSTOM_LLM_BASE_URL = os.getenv("CUSTOM_LLM_BASE_URL", "")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
-KAGGLE_WORKER_URL = os.getenv("KAGGLE_WORKER_URL", "").rstrip("/")
-KAGGLE_WORKER_TOKEN = os.getenv("KAGGLE_WORKER_TOKEN", "").strip()
-IMAGE_WORKER_CONNECT_TIMEOUT = float(os.getenv("IMAGE_WORKER_CONNECT_TIMEOUT", "5"))
-IMAGE_WORKER_READ_TIMEOUT = float(os.getenv("IMAGE_WORKER_READ_TIMEOUT", "180"))
-IMAGE_WORKER_MAX_RETRIES = max(1, min(5, int(os.getenv("IMAGE_WORKER_MAX_RETRIES", "3"))))
-IMAGE_WORKER_RETRY_BASE_SECONDS = max(0.1, float(os.getenv("IMAGE_WORKER_RETRY_BASE_SECONDS", "2")))
 
 # Finite Kaggle batch runner. Autostart is deliberately opt-in.
 KAGGLE_BATCH_AUTOSTART = os.getenv("KAGGLE_BATCH_AUTOSTART", "false").lower() == "true"
 KAGGLE_API_TOKEN = os.getenv("KAGGLE_API_TOKEN", "").strip()
-KAGGLE_USERNAME = os.getenv("KAGGLE_USERNAME", "").strip()
-KAGGLE_KEY = os.getenv("KAGGLE_KEY", "").strip()
 KAGGLE_KERNEL_ID = os.getenv("KAGGLE_KERNEL_ID", "owner/fluxstory-on-demand-worker").strip()
-KAGGLE_KERNEL_PATH = Path(os.getenv("KAGGLE_KERNEL_PATH", str(BASE_DIR / "workers" / "kaggle_fluxstory"))).resolve()
+KAGGLE_KERNEL_PATH = (BASE_DIR / "workers" / "kaggle_fluxstory").resolve()
 KAGGLE_BATCH_ACCELERATOR = os.getenv("KAGGLE_BATCH_ACCELERATOR", "NvidiaTeslaT4").strip()
 KAGGLE_BATCH_TIMEOUT_SECONDS = max(300, min(14400, int(os.getenv("KAGGLE_BATCH_TIMEOUT_SECONDS", "14400"))))
 KAGGLE_BATCH_DEBOUNCE_SECONDS = max(0, min(120, float(os.getenv("KAGGLE_BATCH_DEBOUNCE_SECONDS", "10"))))

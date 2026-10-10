@@ -13,7 +13,7 @@ from config import (KAGGLE_API_TOKEN, KAGGLE_BATCH_ACCELERATOR, KAGGLE_BATCH_AUT
                     KAGGLE_BATCH_MAX_RUNTIME_PER_WEEK_SECONDS, KAGGLE_BATCH_MAX_RUNTIME_SECONDS,
                     KAGGLE_BATCH_MAX_STARTS_PER_DAY, KAGGLE_BATCH_POLL_SECONDS,
                     KAGGLE_BATCH_TIMEOUT_SECONDS, KAGGLE_KERNEL_ID, KAGGLE_KERNEL_PATH,
-                    KAGGLE_KEY, KAGGLE_USERNAME, WORKER_CALLBACK_TOKEN)
+                    WORKER_CALLBACK_TOKEN)
 
 
 class KaggleBatchDispatcher:
@@ -26,8 +26,6 @@ class KaggleBatchDispatcher:
 
     def start(self, enabled=KAGGLE_BATCH_AUTOSTART):
         if not enabled:
-            return False
-        if os.getenv("FLASK_DEBUG", "false").lower() == "true" and os.getenv("WERKZEUG_RUN_MAIN", "").lower() != "true":
             return False
         if self.thread and self.thread.is_alive():
             return True
@@ -46,7 +44,7 @@ class KaggleBatchDispatcher:
                 or KAGGLE_KERNEL_ID.startswith("owner/")):
             self.store.gpu_supervisor_update(unavailable_reason="Set KAGGLE_KERNEL_ID to your actual Kaggle username/notebook-slug.")
             return False
-        if not (KAGGLE_API_TOKEN or (KAGGLE_USERNAME and KAGGLE_KEY)):
+        if not KAGGLE_API_TOKEN:
             self.store.gpu_supervisor_update(unavailable_reason="Kaggle CLI credentials are not configured.")
             return False
         if len(WORKER_CALLBACK_TOKEN) < 32:
@@ -98,10 +96,6 @@ class KaggleBatchDispatcher:
         env = os.environ.copy()
         if KAGGLE_API_TOKEN:
             env["KAGGLE_API_TOKEN"] = KAGGLE_API_TOKEN
-        if KAGGLE_USERNAME:
-            env["KAGGLE_USERNAME"] = KAGGLE_USERNAME
-        if KAGGLE_KEY:
-            env["KAGGLE_KEY"] = KAGGLE_KEY
         return env
 
     def _cli(self, args, timeout):
@@ -120,10 +114,9 @@ class KaggleBatchDispatcher:
         kernel_id = KAGGLE_KERNEL_ID.strip()
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,60}/[A-Za-z0-9_-]{1,100}", kernel_id):
             raise RuntimeError("Set KAGGLE_KERNEL_ID to your Kaggle username/notebook-slug value.")
-        base_url = (os.getenv("RENDER_EXTERNAL_URL", "").strip() or
-                    os.getenv("FLASK_WORKER_BASE_URL", "").strip()).rstrip("/")
+        base_url = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
         if not base_url.startswith("https://"):
-            raise RuntimeError("Render public HTTPS URL is unavailable; set FLASK_WORKER_BASE_URL.")
+            raise RuntimeError("Render public HTTPS URL is unavailable.")
 
         try:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -165,7 +158,7 @@ class KaggleBatchDispatcher:
         return True, None
 
     def launch(self):
-        if not (KAGGLE_API_TOKEN or (KAGGLE_USERNAME and KAGGLE_KEY)):
+        if not KAGGLE_API_TOKEN:
             raise RuntimeError("Kaggle CLI credentials are not configured.")
         if len(WORKER_CALLBACK_TOKEN) < 32:
             raise RuntimeError("WORKER_CALLBACK_TOKEN must be a high-entropy secret of at least 32 characters.")

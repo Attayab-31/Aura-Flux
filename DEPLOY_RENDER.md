@@ -1,6 +1,6 @@
 # Render free deployment with Supabase
 
-This repository now supports Supabase PostgreSQL for accounts and queues, and a private Supabase Storage bucket for scene assets and finished videos. The service stays at one Render instance and one Gunicorn worker. That matches the app's single queue-consumer design.
+This repository requires Supabase PostgreSQL for accounts and queues, and a private Supabase Storage bucket for scene assets and finished videos. Render runs one web instance and one Gunicorn worker. That matches the app's single queue-consumer and Kaggle supervisor design.
 
 ## Supabase setup
 
@@ -19,7 +19,7 @@ The app creates its PostgreSQL tables and enables row-level security at startup.
 4. Set `KAGGLE_BATCH_AUTOSTART=true` only after the private notebook and matching callback token are configured.
 5. Wait for the `/healthz` health check to pass, then create an account and confirm the app can save a project.
 
-If the service is deployed without `SUPABASE_DB_URL`, `SUPABASE_URL`, or `SUPABASE_SERVICE_ROLE_KEY`, startup fails instead of silently falling back to ephemeral SQLite or local-only media. Database connection and Storage upload errors are also surfaced in the service logs.
+The app requires `SUPABASE_DB_URL`, `SUPABASE_URL`, and `SUPABASE_SERVICE_ROLE_KEY`; it stops during startup if any are missing. There is no SQLite, alternate database URL, or local media persistence mode. Database connection and Storage upload errors are surfaced in the service logs.
 
 ## Free-tier limitations
 
@@ -31,5 +31,5 @@ The job consumer and Kaggle supervisor run in the web process. Do not add Gunico
 
 - `SUPABASE_DB_URL` should be the **session** pooler string, not the transaction pooler. The process needs ordinary PostgreSQL transactions and row locks.
 - The service role key bypasses Supabase Storage RLS. It is used only by server code, while the bucket itself stays private.
-- There is no SQLite-to-Supabase data import in this deployment path. Existing local accounts and project records are not migrated automatically.
+- Existing records from a separate local SQLite database are not imported automatically. Create users again in the deployed app or arrange a deliberate migration before launch.
 - Object retention and deletion are not automated yet. Delete obsolete media objects and accounts according to your retention policy.
