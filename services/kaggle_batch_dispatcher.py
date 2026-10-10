@@ -1,5 +1,6 @@
 """Finite Kaggle notebook batch supervisor using the supported Kaggle CLI."""
 import os
+import json
 import re
 import subprocess
 import threading
@@ -40,6 +41,10 @@ class KaggleBatchDispatcher:
     def can_accept_user_jobs(self):
         """Cheap readiness gate before starting LLM/TTS work for a user job."""
         if not KAGGLE_BATCH_AUTOSTART:
+            return False
+        if (not re.fullmatch(r"[A-Za-z0-9_-]{1,60}/[A-Za-z0-9_-]{1,100}", KAGGLE_KERNEL_ID)
+                or KAGGLE_KERNEL_ID.startswith("owner/")):
+            self.store.gpu_supervisor_update(unavailable_reason="Set KAGGLE_KERNEL_ID to your actual Kaggle username/notebook-slug.")
             return False
         if not (KAGGLE_API_TOKEN or (KAGGLE_USERNAME and KAGGLE_KEY)):
             self.store.gpu_supervisor_update(unavailable_reason="Kaggle CLI credentials are not configured.")
@@ -109,6 +114,44 @@ class KaggleBatchDispatcher:
         except subprocess.TimeoutExpired:
             raise RuntimeError("Kaggle CLI operation timed out.")
 
+    @staticmethod
+    def _prepare_kernel_files(metadata_path: Path, notebook_path: Path) -> None:
+        """Fill public deployment details from Render env before pushing the notebook."""
+        kernel_id = KAGGLE_KERNEL_ID.strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,60}/[A-Za-z0-9_-]{1,100}", kernel_id):
+            raise RuntimeError("Set KAGGLE_KERNEL_ID to your Kaggle username/notebook-slug value.")
+        base_url = (os.getenv("RENDER_EXTERNAL_URL", "").strip() or
+                    os.getenv("FLASK_WORKER_BASE_URL", "").strip()).rstrip("/")
+        if not base_url.startswith("https://"):
+            raise RuntimeError("Render public HTTPS URL is unavailable; set FLASK_WORKER_BASE_URL.")
+
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
+            cells = notebook["cells"]
+            source = "".join(cells[3]["source"])
+        except (OSError, ValueError, KeyError, IndexError, TypeError):
+            raise RuntimeError("Kaggle metadata or worker notebook is invalid.") from None
+
+        metadata["id"] = kernel_id
+        source, url_replacements = re.subn(
+            r'^FLASK_WORKER_BASE_URL\s*=.*$',
+            f"FLASK_WORKER_BASE_URL = {json.dumps(base_url)}",
+            source, count=1, flags=re.MULTILINE,
+        )
+        source, id_replacements = re.subn(
+            r'_config_value\("KAGGLE_KERNEL_ID",\s*"[^"]*"\)',
+            json.dumps(kernel_id), source, count=1,
+        )
+        if url_replacements != 1 or id_replacements != 1:
+            raise RuntimeError("Worker notebook config markers could not be updated.")
+        cells[3]["source"] = source.splitlines(keepends=True)
+
+        for path, payload in ((metadata_path, metadata), (notebook_path, notebook)):
+            temporary = path.with_name(path.name + ".partial")
+            temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+            temporary.replace(path)
+
     def budget_allows_start(self):
         snap = self.store.gpu_supervisor_snapshot()
         if KAGGLE_BATCH_MAX_STARTS_PER_DAY <= 0 or snap["launches_24h"] >= KAGGLE_BATCH_MAX_STARTS_PER_DAY:
@@ -147,6 +190,11 @@ class KaggleBatchDispatcher:
             return False
         if observed not in {"COMPLETE", "COMPLETED", "ERROR", "FAILED", "CANCELED", "CANCELLED"}:
             self.store.gpu_supervisor_update(state="idle", unavailable_reason="Kaggle returned an unrecognized run state; automatic launch paused.")
+            return False
+        try:
+            self._prepare_kernel_files(meta, notebook)
+        except RuntimeError as exc:
+            self.store.gpu_supervisor_update(state="idle", unavailable_reason=str(exc)[:160], last_error_at=time.time())
             return False
         dispatch_id = str(uuid.uuid4())
         self.store.gpu_supervisor_update(state="starting", active_dispatch_id=dispatch_id,

@@ -1,4 +1,4 @@
-"""Refresh the Kaggle push directory from the reviewed root notebook."""
+"""Refresh the packaged Kaggle notebook and metadata in the worker directory."""
 import json
 import os
 from pathlib import Path
@@ -21,7 +21,6 @@ code = code.replace('logger.error("Could not report failure for request %s: %s",
                     'logger.error("Could not report GPU request failure (%s)", type(callback_exc).__name__)')
 cell["source"] = code.splitlines(keepends=True)
 serialized = json.dumps(notebook, ensure_ascii=False, indent=1) + "\n"
-source.write_text(serialized, encoding="utf-8")
 source.write_text(serialized, encoding="utf-8")
 existing_metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.exists() else {}
 kernel_id = (os.getenv("KAGGLE_KERNEL_ID", "").strip() or

@@ -15,8 +15,9 @@ The app creates its PostgreSQL tables and enables row-level security at startup.
 
 1. Push this repository to a Git provider that Render can access, then create a **Blueprint** from it. Render reads `render.yaml` and builds the included Dockerfile.
 2. Fill every `sync: false` variable in the Render dashboard. In addition to the three Supabase values, set `DEEPGRAM_API_KEY`, one LLM provider key, Kaggle credentials, your actual `KAGGLE_KERNEL_ID`, and a high-entropy `WORKER_CALLBACK_TOKEN` if you want video generation enabled.
-3. Set `KAGGLE_BATCH_AUTOSTART=true` only after the private Kaggle notebook callback URL and matching token are configured. The worker notebook needs the Render HTTPS origin and the same callback token.
-4. Wait for the `/healthz` health check to pass, then create an account and confirm the app can save a project.
+3. Create the private Kaggle notebook and add only `WORKER_CALLBACK_TOKEN` as a Kaggle Secret. The Render app injects its public HTTPS origin and the configured notebook ID into the notebook and metadata immediately before each push, so you do not edit `kernel-metadata.json` or set those two values as Kaggle Secrets.
+4. Set `KAGGLE_BATCH_AUTOSTART=true` only after the private notebook and matching callback token are configured.
+5. Wait for the `/healthz` health check to pass, then create an account and confirm the app can save a project.
 
 If the service is deployed without `SUPABASE_DB_URL`, `SUPABASE_URL`, or `SUPABASE_SERVICE_ROLE_KEY`, startup fails instead of silently falling back to ephemeral SQLite or local-only media. Database connection and Storage upload errors are also surfaced in the service logs.
 
