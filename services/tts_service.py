@@ -15,6 +15,7 @@ from typing import Optional
 import requests
 from mutagen.mp3 import MP3
 
+from config import DEFAULT_TTS_VOICE
 from services.runtime_settings import get as get_runtime_setting
 
 logger = logging.getLogger(__name__)
