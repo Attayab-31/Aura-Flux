@@ -114,7 +114,7 @@ def all_values() -> dict[str, Any]:
 
 def source(name: str) -> str:
     _, rows = _snapshot()
-    return "Admin panel" if name in rows else "Render environment"
+    return "Customized here" if name in rows else "Workspace setup"
 
 
 def secret_configured(name: str) -> bool:

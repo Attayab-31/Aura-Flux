@@ -79,6 +79,7 @@ gpu_dispatcher = KaggleBatchDispatcher(auth_store)
 gpu_client = KaggleBatchGpuClient(auth_store, gpu_dispatcher)
 configure_batch_request_manager(gpu_client)
 DUMMY_PASSWORD_HASH = generate_password_hash(secrets.token_urlsafe(32), method="scrypt:32768:8:1")
+MIN_PASSWORD_LENGTH = 8
 
 # PostgreSQL stores queued tasks. This in-memory event only wakes the consumer.
 MAX_PENDING_JOBS = 100
@@ -203,8 +204,8 @@ def signup():
         confirmation = request.form.get("password_confirmation", "")
         if len(email) > 254 or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
             error = "Enter a valid email address."
-        elif len(password) < 12 or len(password) > 128:
-            error = "Use a password between 12 and 128 characters."
+        elif len(password) < MIN_PASSWORD_LENGTH or len(password) > 128:
+            error = f"Use a password between {MIN_PASSWORD_LENGTH} and 128 characters."
         elif password != confirmation:
             error = "The passwords do not match."
         else:
@@ -274,8 +275,8 @@ def admin_register():
             else:
                 password = request.form.get("password", "")
                 confirmation = request.form.get("password_confirmation", "")
-                if len(password) < 12 or len(password) > 128:
-                    error = "Use a password between 12 and 128 characters."
+                if len(password) < MIN_PASSWORD_LENGTH or len(password) > 128:
+                    error = f"Use a password between {MIN_PASSWORD_LENGTH} and 128 characters."
                 elif password != confirmation:
                     error = "The passwords do not match."
                 else:
