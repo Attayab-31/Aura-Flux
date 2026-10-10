@@ -31,6 +31,21 @@ def upload_file(key: str, filename: str | Path, content_type: str) -> str:
     return key
 
 
+def delete_files(keys: list[str]) -> None:
+    """Remove a set of exact object keys from the configured private bucket."""
+    unique_keys = sorted({str(key).strip("/") for key in keys if key and str(key).strip("/")})
+    if not unique_keys:
+        return
+    base, secret, bucket = _settings()
+    response = requests.delete(
+        f"{base}/storage/v1/object/{quote(bucket, safe='')}",
+        headers={"apikey": secret, "Authorization": f"Bearer {secret}", "Content-Type": "application/json"},
+        json={"prefixes": unique_keys}, timeout=(10, 60),
+    )
+    if not response.ok:
+        raise RuntimeError(f"Supabase Storage deletion failed ({response.status_code}).")
+
+
 def download_file(key: str, filename: str | Path) -> Path:
     base, secret, bucket = _settings()
     target = Path(filename)

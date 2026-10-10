@@ -27,7 +27,7 @@ from typing import Dict, Any, Optional
 from functools import wraps
 from urllib.parse import urlsplit
 
-from flask import Flask, render_template, request, jsonify, send_from_directory, url_for, session, g, redirect
+from flask import Flask, render_template, request, jsonify, send_from_directory, url_for, session, g, redirect, abort
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from config import (
@@ -51,7 +51,7 @@ from services.image_client import configure_batch_request_manager
 from services.auth_store import AuthStore
 from services.kaggle_batch_dispatcher import KaggleBatchDispatcher
 from services.gpu_request_client import KaggleBatchGpuClient
-from services.object_storage import create_signed_url, download_file, upload_file
+from services.object_storage import create_signed_url, delete_files, download_file, upload_file
 from PIL import Image, UnidentifiedImageError
 import io
 
@@ -702,6 +702,52 @@ def projects_page():
     with JOBS_LOCK:
         jobs = _job_summaries(int(g.current_user["id"]))
     return render_template("projects.html", active_page="projects", jobs=jobs)
+
+
+@app.route("/projects/<job_id>")
+@login_required
+def project_detail_page(job_id: str):
+    """Show the signed-in owner's live project details."""
+    job = auth_store.owned_job(job_id, int(g.current_user["id"]))
+    if not job:
+        abort(404)
+    created_at = job.get("created_at")
+    created_at_label = (datetime.fromtimestamp(float(created_at)).astimezone().strftime("%b %d, %Y at %I:%M %p")
+                        if created_at else "Unknown")
+    return render_template("project_detail.html", active_page="projects", job=job,
+                           job_id=job_id, created_at_label=created_at_label)
+
+
+@app.route("/api/projects/<job_id>", methods=["DELETE"])
+@login_required
+def delete_project_api(job_id: str):
+    """Delete an owned project and its durable queue records."""
+    deleted_job = auth_store.delete_project(job_id, int(g.current_user["id"]))
+    if not deleted_job:
+        return jsonify({"error": "Project not found."}), 404
+
+    with JOBS_LOCK:
+        JOBS.pop(job_id, None)
+
+    # Database rows are removed in one transaction. Storage is a separate
+    # Supabase service, so clean its referenced objects after that commit.
+    owner_id = int(g.current_user["id"])
+    allowed_prefixes = (f"videos/{owner_id}/{job_id}/", f"media/{owner_id}/{job_id}/")
+    object_keys = []
+    candidates = [deleted_job.get("video_storage_key"), deleted_job.get("image_storage_key"),
+                  deleted_job.get("audio_storage_key")]
+    for scene in deleted_job.get("scenes") or []:
+        candidates.extend((scene.get("image_storage_key"), scene.get("audio_storage_key")))
+    for key in candidates:
+        if isinstance(key, str) and key.startswith(allowed_prefixes):
+            object_keys.append(key)
+    cleanup_pending = False
+    try:
+        delete_files(object_keys)
+    except Exception:
+        cleanup_pending = True
+        logger.exception("Project %s was deleted but Supabase media cleanup failed", job_id)
+    return jsonify({"ok": True, "media_cleanup_pending": cleanup_pending}), 200
 
 
 def _job_summaries(user_id: int):

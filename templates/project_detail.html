@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block title %}{{ job.title or 'Project details' }} — AuraFLUX Studio{% endblock %}
+{% block breadcrumb %}<a href="{{ url_for('projects_page') }}">Projects</a> / Project details{% endblock %}
+{% block content %}
+<section class="page-heading project-detail-heading">
+  <div><p class="eyebrow">PROJECT DETAILS</p><h1>{{ job.title or 'Untitled project' }}</h1><p class="page-subtitle">Follow the render, review its story and scenes, and open the finished video here.</p></div>
+  <a href="{{ url_for('projects_page') }}" class="button-secondary"><i class="fa-solid fa-arrow-left" aria-hidden="true"></i> All projects</a>
+</section>
+<section class="detail-status-card" aria-labelledby="render-status-title">
+  <div class="detail-status-top"><div><p class="eyebrow">RENDER STATUS</p><h2 id="render-status-title">{{ job.stage or 'Queued' }}</h2><p id="detail-message" class="detail-message">{{ job.step_description or 'Your project is waiting to start.' }}</p></div><span id="detail-status-badge" class="status-chip status-{{ (job.status or 'queued')|lower }}">{{ (job.status or 'queued')|title }}</span></div>
+  <div class="detail-progress-label"><span>Overall progress</span><strong id="detail-progress-text">{{ job.progress_percent or 0 }}%</strong></div>
+  <div class="progress-track detail-progress-track" role="progressbar" aria-label="Project generation progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{ job.progress_percent or 0 }}"><span id="detail-progress-fill" style="width:{{ job.progress_percent or 0 }}%"></span></div>
+  <div id="queue-position" class="queue-position" {% if job.status != 'QUEUED' %}hidden{% endif %}></div>
+</section>
+
+<div class="project-detail-grid">
+  <section class="library-card detail-content-card"><div class="library-heading"><h2>Story and settings</h2><p>What this project is generating</p></div><div class="detail-body">
+    <h3>Story</h3><p id="detail-story" class="story-copy">{{ job.story_text or 'Story details are not available for this project.' }}</p>
+    <div class="detail-meta-grid">
+      <div><span>Created</span><strong>{{ created_at_label }}</strong></div>
+      <div><span>Project type</span><strong>{{ (job.task_type or 'video')|title }}</strong></div>
+      <div><span>Scenes</span><strong id="detail-scene-count">{{ job.scenes|length if job.scenes else '—' }}</strong></div>
+      <div><span>Target length</span><strong id="detail-duration">{{ job.params.duration_minutes if job.params and job.params.duration_minutes else '—' }}{% if job.params and job.params.duration_minutes %} min{% endif %}</strong></div>
+      <div><span>Format</span><strong id="detail-format">{{ job.params.aspect_ratio if job.params else '—' }}</strong></div>
+      <div><span>Visual style</span><strong id="detail-style">{{ job.params.style_preset|replace('_', ' ')|title if job.params and job.params.style_preset else '—' }}</strong></div>
+      <div><span>Voice</span><strong id="detail-voice">{{ job.params.tts_voice if job.params else '—' }}</strong></div>
+      <div><span>Render time</span><strong id="detail-elapsed">{{ job.elapsed_seconds if job.elapsed_seconds else '—' }}{% if job.elapsed_seconds %} sec{% endif %}</strong></div>
+      <div><span>Project ID</span><strong class="detail-id">{{ job_id }}</strong></div>
+    </div>
+  </div></section>
+  <section id="video-result-card" class="library-card detail-content-card" {% if not job.video_url %}hidden{% endif %}><div class="library-heading"><h2>Finished video</h2><p>Your completed render</p></div><div class="detail-body"><video id="project-video" class="project-video" controls playsinline preload="metadata" {% if job.video_url %}src="{{ job.video_url }}"{% endif %}>Your browser does not support video playback.</video><a id="project-download" class="button-primary detail-download" href="{{ job.video_url or '#' }}" download {% if not job.video_url %}hidden{% endif %}><i class="fa-solid fa-download" aria-hidden="true"></i> Download video</a></div></section>
+  <section id="project-scenes-card" class="library-card detail-content-card" {% if not job.scenes %}hidden{% endif %}><div class="library-heading"><h2>Scenes</h2><p id="scene-summary">Generated scene outline and readiness</p></div><div id="project-scenes" class="scene-detail-list"></div></section>
+  <section id="project-activity-card" class="library-card detail-content-card"><div class="library-heading"><h2>Activity</h2><p>Latest generation updates</p></div><div id="project-activity" class="activity-list" aria-live="polite"><p class="detail-empty">Loading project activity…</p></div></section>
+</div>
+<div id="detail-error" class="detail-error" role="status" hidden></div>
+{% endblock %}
+{% block scripts %}
+<script>
+(() => {
+  const id = {{ job_id|tojson }};
+  const endpoint = {{ url_for('get_job_status', job_id=job_id)|tojson }};
+  const terminal = new Set(['COMPLETED', 'FAILED']);
+  const byId = (name) => document.getElementById(name);
+  const escStatus = (value) => String(value || 'QUEUED').toLowerCase().replace(/[^a-z0-9_-]/g, '');
+  let timer;
+  function renderScenes(scenes) {
+    const list = byId('project-scenes');
+    list.replaceChildren();
+    (scenes || []).forEach((scene, index) => {
+      const item = document.createElement('article'); item.className = 'scene-detail-item';
+      const head = document.createElement('div'); head.className = 'scene-detail-head';
+      const title = document.createElement('strong'); title.textContent = `Scene ${scene.scene_id || index + 1}`;
+      const state = document.createElement('span'); state.className = `scene-state scene-state-${escStatus(scene.status || (scene.image_ready ? 'ready' : 'pending'))}`; state.textContent = scene.image_ready ? 'Image ready' : (scene.status || 'Pending');
+      head.append(title, state);
+      const narration = document.createElement('p'); narration.textContent = scene.narration_text || 'Narration will appear when this scene is planned.';
+      item.append(head, narration);
+      if (scene.visual_prompt) { const prompt = document.createElement('details'); const summary = document.createElement('summary'); summary.textContent = 'Visual prompt'; const text = document.createElement('p'); text.textContent = scene.visual_prompt; prompt.append(summary, text); item.append(prompt); }
+      list.append(item);
+    });
+    byId('project-scenes-card').hidden = !(scenes && scenes.length);
+    byId('detail-scene-count').textContent = String((scenes || []).length || '—');
+    byId('scene-summary').textContent = `${(scenes || []).length} scene${(scenes || []).length === 1 ? '' : 's'} in this project`;
+  }
+  function renderLogs(logs) {
+    const list = byId('project-activity'); list.replaceChildren();
+    const entries = (logs || []).slice(-30);
+    if (!entries.length) { const empty = document.createElement('p'); empty.className = 'detail-empty'; empty.textContent = 'No activity has been recorded yet.'; list.append(empty); return; }
+    entries.slice().reverse().forEach((line) => { const item = document.createElement('p'); item.className = 'activity-item'; item.textContent = line; list.append(item); });
+  }
+  function render(job) {
+    const status = String(job.status || 'QUEUED').toUpperCase();
+    const progress = Math.min(100, Math.max(0, Number(job.progress_percent) || 0));
+    byId('render-status-title').textContent = job.stage || (status === 'QUEUED' ? 'Queued' : 'Working on your project');
+    byId('detail-message').textContent = job.step_description || job.error || (status === 'QUEUED' ? 'Your project is waiting to start.' : 'Generation is in progress.');
+    const badge = byId('detail-status-badge'); badge.textContent = status.charAt(0) + status.slice(1).toLowerCase(); badge.className = `status-chip status-${escStatus(status)}`;
+    byId('detail-progress-text').textContent = `${progress}%`; byId('detail-progress-fill').style.width = `${progress}%`;
+    const bar = document.querySelector('.detail-progress-track'); bar.setAttribute('aria-valuenow', String(progress));
+    const queue = byId('queue-position'); queue.hidden = status !== 'QUEUED'; queue.textContent = job.position ? `Position ${job.position} in the generation queue` : 'Waiting for an available worker…';
+    renderScenes(job.scenes || []); renderLogs(job.logs || []);
+    const params = job.params || {};
+    byId('detail-duration').textContent = params.duration_minutes ? `${params.duration_minutes} min` : '—';
+    byId('detail-format').textContent = params.aspect_ratio || '—';
+    byId('detail-style').textContent = params.style_preset ? params.style_preset.replaceAll('_', ' ').replace(/\b\w/g, (letter) => letter.toUpperCase()) : '—';
+    byId('detail-voice').textContent = params.tts_voice || '—';
+    byId('detail-elapsed').textContent = job.elapsed_seconds ? `${job.elapsed_seconds} sec` : '—';
+    if (job.video_url) { byId('video-result-card').hidden = false; byId('project-video').src = job.video_url; byId('project-download').href = job.video_url; byId('project-download').hidden = false; }
+    if (terminal.has(status)) clearInterval(timer);
+  }
+  async function refresh() {
+    try { const response = await fetch(endpoint, {headers: {'Accept': 'application/json'}}); if (!response.ok) throw new Error(response.status === 404 ? 'This project could not be found.' : 'Could not refresh project details.'); render(await response.json()); byId('detail-error').hidden = true; }
+    catch (error) { byId('detail-error').textContent = `${error.message} Refresh the page to try again.`; byId('detail-error').hidden = false; }
+  }
+  refresh(); timer = setInterval(refresh, 4000);
+})();
+</script>
+{% endblock %}

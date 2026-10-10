@@ -654,10 +654,22 @@ class AuthStore:
             ).fetchall()
             return [json.loads(row["state_json"]) for row in rows]
 
-    def delete_project(self, job_id: str, user_id: int) -> None:
-        """Remove a project record that could not be accepted into the queue."""
+    def delete_project(self, job_id: str, user_id: int) -> dict[str, Any] | None:
+        """Atomically remove an owner's project, job, and queued GPU requests."""
         with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT state_json FROM jobs WHERE task_id = ? AND user_id = ? FOR UPDATE",
+                (job_id, user_id),
+            ).fetchone()
+            if not row:
+                return None
+            state = json.loads(row["state_json"])
+            db.execute("DELETE FROM gpu_requests WHERE parent_task_id = ? AND user_id = ?",
+                       (job_id, user_id))
+            db.execute("DELETE FROM jobs WHERE task_id = ? AND user_id = ?", (job_id, user_id))
             db.execute("DELETE FROM projects WHERE id = ? AND user_id = ?", (job_id, user_id))
+            return state
 
     def recent_login_attempts(self, identity_hash: str, since: float) -> int:
         with self.connect() as db:
