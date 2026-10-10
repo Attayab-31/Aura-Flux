@@ -1,5 +1,5 @@
 {
-  "id": "owner/fluxstory-on-demand-worker",
+  "id": "attayabashraf/fluxstory-on-demand-batch-worker",
   "title": "FluxStory On-Demand Batch Worker",
   "code_file": "fluxstory_kaggle_auto_batch_worker.ipynb",
   "language": "python",
@@ -7,6 +7,7 @@
   "is_private": true,
   "enable_gpu": true,
   "enable_internet": true,
+  "machine_shape": "NvidiaTeslaT4",
   "dataset_sources": ["attayabashraf/fluxstory-worker-secrets"],
   "competition_sources": [],
   "kernel_sources": []

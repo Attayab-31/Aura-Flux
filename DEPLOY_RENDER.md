@@ -14,10 +14,16 @@ The app creates its PostgreSQL tables and enables row-level security at startup.
 ## Render setup
 
 1. Push this repository to a Git provider that Render can access, then create a **Blueprint** from it. Render reads `render.yaml` and builds the included Dockerfile.
-2. Fill every `sync: false` variable in the Render dashboard. In addition to the three Supabase values, set `DEEPGRAM_API_KEY`, one LLM provider key, Kaggle credentials, your actual `KAGGLE_KERNEL_ID`, and a high-entropy `WORKER_CALLBACK_TOKEN` if you want video generation enabled.
+2. Fill every `sync: false` variable in the Render dashboard. In addition to the three Supabase values, set `DEEPGRAM_API_KEY`, one LLM provider key, Kaggle credentials, your actual `KAGGLE_KERNEL_ID`, a high-entropy `WORKER_CALLBACK_TOKEN`, and `ADMIN_REGISTRATION_CODE`. Copy the `ADMIN_REGISTRATION_CODE` from your ignored local `.env` file into Render; do not commit it or send it in chat. Keep Render's generated `SETTINGS_ENCRYPTION_KEY` stable across deployments because admin-entered API keys are encrypted with it.
 3. Create the private Kaggle notebook. Render injects its public HTTPS origin and configured notebook ID before each push. `kernels push` does not attach UI-managed Kaggle Secrets to its automated run, so create a **private Kaggle Dataset** with slug `fluxstory-worker-secrets` containing `worker_callback_token.txt` (the same value as Render's `WORKER_CALLBACK_TOKEN`). Attach it in the Kaggle UI and keep `dataset_sources` set to `attayabashraf/fluxstory-worker-secrets` in `workers/kaggle_fluxstory/kernel-metadata.json`. Never print the token or put it in notebook source.
 4. Set `KAGGLE_BATCH_AUTOSTART=true` only after the private notebook and matching callback token are configured.
 5. Wait for the `/healthz` health check to pass, then create an account and confirm the app can save a project.
+
+## First administrator and settings panel
+
+After deploying the updated app, open `/admin/register` and create the first admin account using the `ADMIN_REGISTRATION_CODE` value from Render. This bootstrap code can create only one administrator. The admin signs in at `/login` and opens **Admin settings** in the left navigation (or `/admin`). The panel saves settings in Supabase, encrypts API credentials at rest, and applies changes without a redeploy. Blank API key fields keep their current value; use the explicit remove option to clear a saved override. “Restore environment values” removes panel overrides for that section.
+
+Keep `WORKER_CALLBACK_TOKEN` in Render and in the private Kaggle worker dataset; it is intentionally not editable in the panel because both sides must use the same secret. Notebook idle, runtime, poll, and HTTP timeout values are injected into the notebook when Render pushes a new Kaggle version.
 
 The app requires `SUPABASE_DB_URL`, `SUPABASE_URL`, and `SUPABASE_SERVICE_ROLE_KEY`; it stops during startup if any are missing. There is no SQLite, alternate database URL, or local media persistence mode. Database connection and Storage upload errors are surfaced in the service logs.
 

@@ -6,10 +6,15 @@ Central Configuration and Path Management for AI Video Generation Control Plane
 """
 
 import os
+import base64
+import hashlib
 from pathlib import Path
+
+from dotenv import load_dotenv
 
 # Base project paths
 BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env", override=False)
 # Local disk is scratch space for active media rendering only; durable data lives
 # in Supabase PostgreSQL and Storage.
 TEMP_DIR = BASE_DIR / "temp"
@@ -20,6 +25,13 @@ SECRET_KEY = os.getenv("SECRET_KEY", "")
 if len(SECRET_KEY) < 32 or SECRET_KEY.startswith("change-this"):
     raise RuntimeError("Set SECRET_KEY to a random value of at least 32 characters in Render environment settings.")
 MAX_CONTENT_LENGTH = 64 * 1024 * 1024  # 64 MB
+# A dedicated Render value is preferred. The fallback keeps local installs
+# working while separating the derived key from Flask's session key by purpose.
+_settings_key_source = os.getenv("SETTINGS_ENCRYPTION_KEY", "").strip() or SECRET_KEY
+SETTINGS_ENCRYPTION_KEY = base64.urlsafe_b64encode(
+    hashlib.sha256(b"auraflux-admin-settings-v1:" + _settings_key_source.encode("utf-8")).digest()
+).decode("ascii")
+ADMIN_REGISTRATION_CODE = os.getenv("ADMIN_REGISTRATION_CODE", "").strip()
 
 # Supabase is the only supported persistence backend.
 SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL", "").strip()
@@ -59,6 +71,10 @@ WORKER_CALLBACK_TOKEN = os.getenv("WORKER_CALLBACK_TOKEN", "").strip()
 GPU_REQUEST_MAX_PENDING = max(1, min(1000, int(os.getenv("GPU_REQUEST_MAX_PENDING", "500"))))
 GPU_REQUEST_LEASE_SECONDS = max(60, int(os.getenv("GPU_REQUEST_LEASE_SECONDS", "900")))
 GPU_REQUEST_MAX_ATTEMPTS = max(1, min(5, int(os.getenv("GPU_REQUEST_MAX_ATTEMPTS", "3"))))
+WORKER_IDLE_EXIT_SECONDS = max(10, min(600, int(os.getenv("WORKER_IDLE_EXIT_SECONDS", "45"))))
+WORKER_MAX_RUNTIME_SECONDS = max(300, min(14400, int(os.getenv("WORKER_MAX_RUNTIME_SECONDS", "14400"))))
+WORKER_POLL_INTERVAL_SECONDS = max(0.5, min(30.0, float(os.getenv("WORKER_POLL_INTERVAL_SECONDS", "2"))))
+WORKER_HTTP_TIMEOUT_SECONDS = max(10, min(180, int(os.getenv("WORKER_HTTP_TIMEOUT_SECONDS", "45"))))
 
 # AI & Generation Configuration
 DEFAULT_LLM_MODEL = os.getenv("DEFAULT_LLM_MODEL", "gpt-4o-mini")
@@ -72,7 +88,7 @@ LLM_PROVIDER_SETTINGS = {
 DEFAULT_TTS_VOICE = os.getenv("DEFAULT_TTS_VOICE", "aura-2-thalia-en")
 DEFAULT_FPS = int(os.getenv("DEFAULT_FPS", "30"))
 CROSSFADE_BUFFER = float(os.getenv("CROSSFADE_BUFFER", "1.0"))  # Seconds overlap for smooth transitions
-TARGET_SCENE_DURATION_SEC = 7.0  # Ideal target length per scene (6-8s)
+TARGET_SCENE_DURATION_SEC = max(4.0, min(12.0, float(os.getenv("TARGET_SCENE_DURATION_SEC", "7"))))
 
 # H.264 / FLUX Resolution Profiles (Always snapped to multiples of 16)
 RESOLUTION_PROFILES = {

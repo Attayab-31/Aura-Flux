@@ -5,6 +5,7 @@ import hashlib
 from pathlib import Path
 
 from config import GPU_REQUEST_MAX_PENDING
+from services.runtime_settings import get as get_runtime_setting
 from services.image_client import WorkerUnavailableError, WorkerRequestError
 from services.object_storage import download_file
 
@@ -36,7 +37,7 @@ class KaggleBatchGpuClient:
                          "reference_image_path": str(reference_path) if reference_path else None,
                          "output_key": str(path)})
         try:
-            self.store.enqueue_gpu_requests(rows, GPU_REQUEST_MAX_PENDING)
+            self.store.enqueue_gpu_requests(rows, int(get_runtime_setting("GPU_REQUEST_MAX_PENDING", GPU_REQUEST_MAX_PENDING)))
         except OverflowError as exc:
             raise WorkerUnavailableError("The GPU request queue is full; retry shortly.") from exc
         if self.dispatcher:

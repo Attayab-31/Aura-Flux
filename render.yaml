@@ -8,6 +8,10 @@ services:
     envVars:
       - key: SECRET_KEY
         generateValue: true
+      - key: SETTINGS_ENCRYPTION_KEY
+        generateValue: true
+      - key: ADMIN_REGISTRATION_CODE
+        sync: false
       - key: SUPABASE_DB_URL
         sync: false
       - key: SUPABASE_URL
@@ -18,6 +22,22 @@ services:
         value: fluxstory-media
       - key: KAGGLE_BATCH_AUTOSTART
         value: "false"
+      - key: KAGGLE_BATCH_ACCELERATOR
+        value: NvidiaTeslaT4
+      - key: KAGGLE_BATCH_TIMEOUT_SECONDS
+        value: "14400"
+      - key: KAGGLE_BATCH_DEBOUNCE_SECONDS
+        value: "10"
+      - key: KAGGLE_BATCH_IDLE_EXIT_SECONDS
+        value: "45"
+      - key: KAGGLE_BATCH_MAX_RUNTIME_SECONDS
+        value: "14400"
+      - key: KAGGLE_BATCH_MAX_STARTS_PER_DAY
+        value: "6"
+      - key: KAGGLE_BATCH_MAX_RUNTIME_PER_WEEK_SECONDS
+        value: "0"
+      - key: KAGGLE_BATCH_POLL_SECONDS
+        value: "60"
       - key: KAGGLE_API_TOKEN
         sync: false
       - key: KAGGLE_KERNEL_ID
@@ -32,3 +52,23 @@ services:
         sync: false
       - key: DEFAULT_LLM_MODEL
         value: gemini-2.5-flash
+      - key: DEFAULT_FPS
+        value: "30"
+      - key: CROSSFADE_BUFFER
+        value: "1.0"
+      - key: TARGET_SCENE_DURATION_SEC
+        value: "7"
+      - key: GPU_REQUEST_MAX_PENDING
+        value: "500"
+      - key: GPU_REQUEST_LEASE_SECONDS
+        value: "900"
+      - key: GPU_REQUEST_MAX_ATTEMPTS
+        value: "3"
+      - key: WORKER_IDLE_EXIT_SECONDS
+        value: "45"
+      - key: WORKER_MAX_RUNTIME_SECONDS
+        value: "14400"
+      - key: WORKER_POLL_INTERVAL_SECONDS
+        value: "2"
+      - key: WORKER_HTTP_TIMEOUT_SECONDS
+        value: "45"

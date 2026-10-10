@@ -31,13 +31,9 @@ from flask import Flask, render_template, request, jsonify, send_from_directory,
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from config import (
-    TEMP_DIR, SECRET_KEY, MAX_CONTENT_LENGTH,
-    DEEPGRAM_API_KEY, LLM_PROVIDER,
-    KAGGLE_BATCH_AUTOSTART, KAGGLE_KERNEL_ID, KAGGLE_BATCH_IDLE_EXIT_SECONDS,
-    KAGGLE_BATCH_MAX_RUNTIME_SECONDS, KAGGLE_BATCH_MAX_RUNTIME_PER_WEEK_SECONDS,
-    KAGGLE_BATCH_MAX_STARTS_PER_DAY, GPU_REQUEST_LEASE_SECONDS, GPU_REQUEST_MAX_ATTEMPTS,
+    TEMP_DIR, SECRET_KEY, MAX_CONTENT_LENGTH, ADMIN_REGISTRATION_CODE,
     WORKER_CALLBACK_TOKEN,
-    DEFAULT_LLM_MODEL, DEFAULT_TTS_VOICE, DEFAULT_FPS, RESOLUTION_PROFILES,
+    RESOLUTION_PROFILES,
     AURA_VOICES, STYLE_PRESETS, VOICE_PREVIEW_TEXT, get_resolution
 )
 from services import (
@@ -52,6 +48,12 @@ from services.auth_store import AuthStore
 from services.kaggle_batch_dispatcher import KaggleBatchDispatcher
 from services.gpu_request_client import KaggleBatchGpuClient
 from services.object_storage import create_signed_url, delete_files, download_file, upload_file
+from services.runtime_settings import (
+    DEFAULT_SETTINGS, SECRET_SETTINGS, configure as configure_runtime_settings,
+    get as get_runtime_setting, all_values as all_runtime_settings,
+    source as runtime_setting_source, secret_configured, save as save_runtime_settings,
+    reset as reset_runtime_settings,
+)
 from PIL import Image, UnidentifiedImageError
 import io
 
@@ -72,6 +74,7 @@ app.config["SESSION_COOKIE_SECURE"] = True
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=14)
 
 auth_store = AuthStore()
+configure_runtime_settings(auth_store)
 gpu_dispatcher = KaggleBatchDispatcher(auth_store)
 gpu_client = KaggleBatchGpuClient(auth_store, gpu_dispatcher)
 configure_batch_request_manager(gpu_client)
@@ -156,6 +159,15 @@ def login_required(view):
     return wrapped
 
 
+def admin_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not g.current_user or g.current_user.get("role") != "admin":
+            abort(403)
+        return view(*args, **kwargs)
+    return wrapped
+
+
 def _safe_next_path(path: str | None) -> str:
     parsed = urlsplit(path or "")
     if path and "\\" not in path and parsed.scheme == "" and parsed.netloc == "" and parsed.path.startswith("/") and not parsed.path.startswith("//"):
@@ -228,8 +240,193 @@ def login():
             else:
                 auth_store.clear_login_attempts(identity_hash)
                 _start_user_session(user["id"])
-                return redirect(_safe_next_path(request.form.get("next")))
+                requested_next = request.form.get("next")
+                if requested_next:
+                    return redirect(_safe_next_path(requested_next))
+                if user.get("role") == "admin":
+                    return redirect(url_for("admin_panel"))
+                return redirect(url_for("index"))
     return render_template("auth.html", auth_mode="login", error=error, next_path=next_path)
+
+
+@app.route("/admin/register", methods=["GET", "POST"])
+def admin_register():
+    if g.current_user:
+        return redirect(url_for("admin_panel") if g.current_user.get("role") == "admin" else url_for("index"))
+    error = None
+    if not ADMIN_REGISTRATION_CODE or len(ADMIN_REGISTRATION_CODE) < 32:
+        error = "Admin registration is not configured. Ask the workspace owner to configure the admin code."
+    elif not auth_store.admin_bootstrap_available():
+        error = "The one-time admin registration has already been used."
+    elif request.method == "POST":
+        email = request.form.get("email", "").strip().casefold()
+        identity_hash = _login_identity_hash("admin-register")
+        now = time.time()
+        if auth_store.recent_login_attempts(identity_hash, now - 900) >= 5:
+            error = "Too many registration attempts. Wait 15 minutes and try again."
+        else:
+            auth_store.record_login_attempt(identity_hash, now)
+            submitted_code = request.form.get("admin_code", "")
+            if not hmac.compare_digest(submitted_code.encode("utf-8"), ADMIN_REGISTRATION_CODE.encode("utf-8")):
+                error = "The admin code is incorrect."
+            elif len(email) > 254 or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+                error = "Enter a valid email address."
+            else:
+                password = request.form.get("password", "")
+                confirmation = request.form.get("password_confirmation", "")
+                if len(password) < 12 or len(password) > 128:
+                    error = "Use a password between 12 and 128 characters."
+                elif password != confirmation:
+                    error = "The passwords do not match."
+                else:
+                    existing_user = auth_store.get_user_by_email(email)
+                    if existing_user and not check_password_hash(existing_user["password_hash"], password):
+                        error = "An account already uses this email. Enter that account's current password to make it the admin account."
+                    else:
+                        user_id = auth_store.create_bootstrap_admin(
+                            email, generate_password_hash(password, method="scrypt:32768:8:1"))
+                        if user_id is None:
+                            error = "Admin registration has already been claimed."
+                        else:
+                            _start_user_session(user_id)
+                            return redirect(url_for("admin_panel"))
+    return render_template("admin_register.html", error=error)
+
+
+ADMIN_SETTING_GROUPS = {
+    "ai": {
+        "title": "AI and narration",
+        "keys": ("LLM_PROVIDER", "DEFAULT_LLM_MODEL", "LLM_FALLBACKS", "OPENAI_API_KEY",
+                 "GEMINI_API_KEY", "GROQ_API_KEY", "CUSTOM_LLM_API_KEY", "CUSTOM_LLM_BASE_URL",
+                 "DEEPGRAM_API_KEY", "DEFAULT_TTS_VOICE"),
+    },
+    "video": {"title": "Video look and timing", "keys": ("DEFAULT_FPS", "CROSSFADE_BUFFER", "TARGET_SCENE_DURATION_SEC")},
+    "worker": {
+        "title": "Kaggle GPU worker",
+        "keys": ("KAGGLE_BATCH_AUTOSTART", "KAGGLE_API_TOKEN", "KAGGLE_KERNEL_ID", "KAGGLE_BATCH_ACCELERATOR",
+                 "KAGGLE_BATCH_TIMEOUT_SECONDS", "KAGGLE_BATCH_DEBOUNCE_SECONDS", "KAGGLE_BATCH_IDLE_EXIT_SECONDS",
+                 "KAGGLE_BATCH_MAX_RUNTIME_SECONDS", "KAGGLE_BATCH_MAX_STARTS_PER_DAY",
+                 "KAGGLE_BATCH_MAX_RUNTIME_PER_WEEK_SECONDS", "KAGGLE_BATCH_POLL_SECONDS",
+                 "WORKER_IDLE_EXIT_SECONDS", "WORKER_MAX_RUNTIME_SECONDS", "WORKER_POLL_INTERVAL_SECONDS",
+                 "WORKER_HTTP_TIMEOUT_SECONDS"),
+    },
+    "queue": {"title": "GPU request queue", "keys": ("GPU_REQUEST_MAX_PENDING", "GPU_REQUEST_LEASE_SECONDS", "GPU_REQUEST_MAX_ATTEMPTS")},
+}
+
+
+def _admin_panel_data(section="ai", error=None, success=None):
+    section = section if section in ADMIN_SETTING_GROUPS else "ai"
+    all_settings = all_runtime_settings()
+    values = {key: all_settings.get(key, DEFAULT_SETTINGS.get(key)) for group in ADMIN_SETTING_GROUPS.values() for key in group["keys"]}
+    for key in SECRET_SETTINGS:
+        values.pop(key, None)  # Never send a stored credential back to the browser.
+    secret_states = {key: secret_configured(key) for key in SECRET_SETTINGS}
+    sources = {key: runtime_setting_source(key) for group in ADMIN_SETTING_GROUPS.values() for key in group["keys"]}
+    return render_template("admin.html", active_page="admin", section=section,
+                           groups=ADMIN_SETTING_GROUPS, values=values, secret_states=secret_states,
+                           sources=sources, overview=auth_store.admin_overview(),
+                           gpu=auth_store.gpu_supervisor_snapshot(), error=error, success=success,
+                           voices=AURA_VOICES)
+
+
+def _bounded_form_value(name, *, low, high, integer=False):
+    raw = request.form.get(name, "").strip()
+    value = int(raw) if integer else float(raw)
+    if not low <= value <= high:
+        raise ValueError(f"{name.replace('_', ' ')} must be between {low} and {high}.")
+    return value
+
+
+@app.route("/admin", methods=["GET", "POST"])
+@login_required
+@admin_required
+def admin_panel():
+    section = request.values.get("section", "ai")
+    if section not in ADMIN_SETTING_GROUPS:
+        section = "ai"
+    if request.method == "GET":
+        return _admin_panel_data(section)
+
+    if request.form.get("action") == "reset":
+        reset_runtime_settings(list(ADMIN_SETTING_GROUPS[section]["keys"]))
+        if section == "worker":
+            gpu_dispatcher.start(enabled=get_runtime_setting("KAGGLE_BATCH_AUTOSTART", False))
+            gpu_dispatcher.notify()
+        QUEUE_WAKE.set()
+        return _admin_panel_data(section, success=f"{ADMIN_SETTING_GROUPS[section]['title']} restored to Render environment values.")
+
+    try:
+        values = {}
+        if section == "ai":
+            provider = request.form.get("LLM_PROVIDER", "").strip().lower()
+            if provider not in {"openai", "gemini", "groq", "custom"}:
+                raise ValueError("Choose one of the listed AI providers.")
+            values.update(LLM_PROVIDER=provider,
+                          DEFAULT_LLM_MODEL=request.form.get("DEFAULT_LLM_MODEL", "").strip(),
+                          LLM_FALLBACKS=request.form.get("LLM_FALLBACKS", "").strip(),
+                          CUSTOM_LLM_BASE_URL=request.form.get("CUSTOM_LLM_BASE_URL", "").strip(),
+                          DEFAULT_TTS_VOICE=request.form.get("DEFAULT_TTS_VOICE", "").strip())
+            if not values["DEFAULT_LLM_MODEL"] or len(values["DEFAULT_LLM_MODEL"]) > 160:
+                raise ValueError("Enter an AI model name (160 characters or fewer).")
+            if len(values["LLM_FALLBACKS"]) > 500:
+                raise ValueError("Fallback list is too long.")
+            if values["CUSTOM_LLM_BASE_URL"] and urlsplit(values["CUSTOM_LLM_BASE_URL"]).scheme not in {"http", "https"}:
+                raise ValueError("Custom AI URL must start with https:// or http://.")
+            voice_ids = {voice["id"] for voice in AURA_VOICES}
+            if values["DEFAULT_TTS_VOICE"] not in voice_ids:
+                raise ValueError("Choose one of the available narration voices.")
+        elif section == "video":
+            values = {
+                "DEFAULT_FPS": _bounded_form_value("DEFAULT_FPS", low=12, high=60, integer=True),
+                "CROSSFADE_BUFFER": _bounded_form_value("CROSSFADE_BUFFER", low=0, high=5),
+                "TARGET_SCENE_DURATION_SEC": _bounded_form_value("TARGET_SCENE_DURATION_SEC", low=4, high=12),
+            }
+        elif section == "worker":
+            values = {
+                "KAGGLE_BATCH_AUTOSTART": request.form.get("KAGGLE_BATCH_AUTOSTART") == "true",
+                "KAGGLE_KERNEL_ID": request.form.get("KAGGLE_KERNEL_ID", "").strip(),
+                "KAGGLE_BATCH_ACCELERATOR": request.form.get("KAGGLE_BATCH_ACCELERATOR", "").strip(),
+                "KAGGLE_BATCH_TIMEOUT_SECONDS": _bounded_form_value("KAGGLE_BATCH_TIMEOUT_SECONDS", low=300, high=14400, integer=True),
+                "KAGGLE_BATCH_DEBOUNCE_SECONDS": _bounded_form_value("KAGGLE_BATCH_DEBOUNCE_SECONDS", low=0, high=120),
+                "KAGGLE_BATCH_IDLE_EXIT_SECONDS": _bounded_form_value("KAGGLE_BATCH_IDLE_EXIT_SECONDS", low=10, high=600, integer=True),
+                "KAGGLE_BATCH_MAX_RUNTIME_SECONDS": _bounded_form_value("KAGGLE_BATCH_MAX_RUNTIME_SECONDS", low=300, high=14400, integer=True),
+                "KAGGLE_BATCH_MAX_STARTS_PER_DAY": _bounded_form_value("KAGGLE_BATCH_MAX_STARTS_PER_DAY", low=0, high=100, integer=True),
+                "KAGGLE_BATCH_MAX_RUNTIME_PER_WEEK_SECONDS": _bounded_form_value("KAGGLE_BATCH_MAX_RUNTIME_PER_WEEK_SECONDS", low=0, high=604800, integer=True),
+                "KAGGLE_BATCH_POLL_SECONDS": _bounded_form_value("KAGGLE_BATCH_POLL_SECONDS", low=15, high=300, integer=True),
+                "WORKER_IDLE_EXIT_SECONDS": _bounded_form_value("WORKER_IDLE_EXIT_SECONDS", low=10, high=600, integer=True),
+                "WORKER_MAX_RUNTIME_SECONDS": _bounded_form_value("WORKER_MAX_RUNTIME_SECONDS", low=300, high=14400, integer=True),
+                "WORKER_POLL_INTERVAL_SECONDS": _bounded_form_value("WORKER_POLL_INTERVAL_SECONDS", low=0.5, high=30),
+                "WORKER_HTTP_TIMEOUT_SECONDS": _bounded_form_value("WORKER_HTTP_TIMEOUT_SECONDS", low=10, high=180, integer=True),
+            }
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,60}/[A-Za-z0-9_-]{1,100}", values["KAGGLE_KERNEL_ID"]):
+                raise ValueError("Enter the Kaggle notebook ID as username/notebook-slug.")
+            if not values["KAGGLE_BATCH_ACCELERATOR"] or len(values["KAGGLE_BATCH_ACCELERATOR"]) > 50:
+                raise ValueError("Enter the accelerator name accepted by Kaggle, such as NvidiaTeslaT4.")
+        else:
+            values = {
+                "GPU_REQUEST_MAX_PENDING": _bounded_form_value("GPU_REQUEST_MAX_PENDING", low=1, high=1000, integer=True),
+                "GPU_REQUEST_LEASE_SECONDS": _bounded_form_value("GPU_REQUEST_LEASE_SECONDS", low=60, high=3600, integer=True),
+                "GPU_REQUEST_MAX_ATTEMPTS": _bounded_form_value("GPU_REQUEST_MAX_ATTEMPTS", low=1, high=5, integer=True),
+            }
+
+        if section in {"ai", "worker"}:
+            secret_fields = ("OPENAI_API_KEY", "GEMINI_API_KEY", "GROQ_API_KEY", "CUSTOM_LLM_API_KEY", "DEEPGRAM_API_KEY") if section == "ai" else ("KAGGLE_API_TOKEN",)
+            for key in secret_fields:
+                new_value = request.form.get(key, "").strip()
+                if key in request.form.getlist("clear_secret"):
+                    reset_runtime_settings([key])
+                elif new_value:
+                    if len(new_value) > 4096:
+                        raise ValueError("An API key is longer than the allowed limit.")
+                    values[key] = new_value
+        save_runtime_settings(values, int(g.current_user["id"]))
+        if section == "worker":
+            gpu_dispatcher.start(enabled=get_runtime_setting("KAGGLE_BATCH_AUTOSTART", False))
+            gpu_dispatcher.notify()
+        QUEUE_WAKE.set()
+        return _admin_panel_data(section, success="Settings saved. Changes are active now.")
+    except (ValueError, TypeError, OverflowError) as exc:
+        return _admin_panel_data(section, error=str(exc)), 400
 
 
 @app.route("/logout", methods=["POST"])
@@ -289,10 +486,10 @@ def run_video_generation_pipeline(job_id: str, params: Dict[str, Any]) -> None:
     try:
         story_text = params["story_text"]
         duration_minutes = float(params.get("duration_minutes", 1.0))
-        target_scene_count = int(params.get("image_count", min(60, max(2, round(duration_minutes * 60 / 7)))))
+        target_scene_count = int(params.get("image_count", min(60, max(2, round(duration_minutes * 60 / float(get_runtime_setting("TARGET_SCENE_DURATION_SEC", 7.0)))))))
         aspect_ratio = params.get("aspect_ratio", "16:9")
-        deepgram_key = DEEPGRAM_API_KEY
-        tts_voice = params.get("tts_voice") or DEFAULT_TTS_VOICE
+        deepgram_key = get_runtime_setting("DEEPGRAM_API_KEY", "")
+        tts_voice = params.get("tts_voice") or get_runtime_setting("DEFAULT_TTS_VOICE", "aura-2-thalia-en")
         style_preset = params.get("style_preset", "cinematic")
         resolution = get_resolution(aspect_ratio)
 
@@ -311,9 +508,9 @@ def run_video_generation_pipeline(job_id: str, params: Dict[str, Any]) -> None:
                 story_text=story_text,
                 duration_minutes=duration_minutes,
                 api_key=None,
-                model=DEFAULT_LLM_MODEL,
+                model=get_runtime_setting("DEFAULT_LLM_MODEL", "gpt-4o-mini"),
                 style_preset=style_preset,
-                provider=LLM_PROVIDER,
+                provider=get_runtime_setting("LLM_PROVIDER", "openai"),
                 target_scene_count=target_scene_count
             )
             for sc in scenes:
@@ -463,7 +660,7 @@ def run_video_generation_pipeline(job_id: str, params: Dict[str, Any]) -> None:
             scene_manifest=scenes,
             output_filename=output_filename,
             resolution=resolution,
-            fps=DEFAULT_FPS,
+            fps=int(get_runtime_setting("DEFAULT_FPS", 30)),
             progress_callback=video_progress_cb
         )
 
@@ -580,7 +777,7 @@ def _durable_queue_consumer() -> None:
     worker_id = f"{os.getpid()}-{uuid.uuid4()}"
     try:
         auth_store.recover_abandoned_jobs(MAX_JOB_ATTEMPTS)
-        auth_store.recover_gpu_leases(GPU_REQUEST_MAX_ATTEMPTS)
+        auth_store.recover_gpu_leases(int(get_runtime_setting("GPU_REQUEST_MAX_ATTEMPTS", 3)))
         for job in auth_store.load_jobs():
             with JOBS_LOCK:
                 JOBS[job.get("task_id") or job.get("job_id")] = job
@@ -609,7 +806,7 @@ def _durable_queue_consumer() -> None:
                 QUEUE_WAKE.clear()
                 continue
 
-            if not KAGGLE_BATCH_AUTOSTART:
+            if not get_runtime_setting("KAGGLE_BATCH_AUTOSTART", False):
                 QUEUE_WAKE.wait(30.0)
                 QUEUE_WAKE.clear()
                 continue
@@ -690,7 +887,8 @@ def create_page():
     """Renders the video creation workspace."""
     return render_template(
         "create.html", active_page="create", resolution_profiles=RESOLUTION_PROFILES,
-        voices=AURA_VOICES, style_presets=STYLE_PRESETS, default_voice=DEFAULT_TTS_VOICE,
+        voices=AURA_VOICES, style_presets=STYLE_PRESETS,
+        default_voice=get_runtime_setting("DEFAULT_TTS_VOICE", "aura-2-thalia-en"),
         voice_preview_text=VOICE_PREVIEW_TEXT
     )
 
@@ -803,7 +1001,7 @@ def create_video():
     style_preset = str(payload.get("style_preset", "cinematic"))
     if style_preset not in STYLE_PRESETS:
         return jsonify({"error": "Unsupported visual style."}), 400
-    tts_voice = str(payload.get("tts_voice", DEFAULT_TTS_VOICE))
+    tts_voice = str(payload.get("tts_voice", get_runtime_setting("DEFAULT_TTS_VOICE", "aura-2-thalia-en")))
     allowed_voices = {voice["id"] for voice in AURA_VOICES}
     if tts_voice not in allowed_voices:
         return jsonify({"error": "Unsupported voice selection."}), 400
@@ -951,7 +1149,8 @@ def internal_gpu_worker_started():
     payload, error = _worker_payload()
     if error:
         return error
-    if payload.get("kernel_id") != KAGGLE_KERNEL_ID:
+    active_kernel_id = str(get_runtime_setting("KAGGLE_KERNEL_ID", "")).strip()
+    if payload.get("kernel_id") != active_kernel_id:
         return jsonify({"error": "Kernel does not match active dispatch."}), 409
     try:
         started_at = float(payload.get("started_at"))
@@ -963,7 +1162,7 @@ def internal_gpu_worker_started():
         return jsonify({"error": "Worker runtime settings are outside allowed bounds."}), 400
     if started_at > time.time() + 60 or time.time() - started_at > 900:
         return jsonify({"error": "Stale worker start callback."}), 409
-    if not auth_store.gpu_callback_started(payload["worker_run_id"], KAGGLE_KERNEL_ID, started_at):
+    if not auth_store.gpu_callback_started(payload["worker_run_id"], active_kernel_id, started_at):
         return jsonify({"error": "No matching active batch dispatch."}), 409
     return jsonify({"ok": True, "state": "running"}), 200
 
@@ -997,7 +1196,7 @@ def internal_gpu_claim():
     supervisor = auth_store.gpu_supervisor_snapshot()
     if supervisor.get("worker_run_id") != payload["worker_run_id"] or supervisor.get("state") != "running":
         return jsonify({"error": "Stale worker run."}), 409
-    row = auth_store.claim_gpu_request(payload["worker_run_id"], GPU_REQUEST_LEASE_SECONDS)
+    row = auth_store.claim_gpu_request(payload["worker_run_id"], int(get_runtime_setting("GPU_REQUEST_LEASE_SECONDS", 900)))
     if not row:
         return jsonify({"request": None, "queue_depth": auth_store.gpu_queue_depth()}), 200
     image_b64 = None
@@ -1092,7 +1291,7 @@ def internal_gpu_fail(request_id):
         return jsonify({"error": "GPU request not found."}), 404
     if row.get("worker_run_id") != payload["worker_run_id"]:
         return jsonify({"error": "Stale worker run."}), 409
-    state = auth_store.fail_gpu_request(request_id, payload["worker_run_id"], "Image generation failed in the GPU worker.", GPU_REQUEST_MAX_ATTEMPTS)
+    state = auth_store.fail_gpu_request(request_id, payload["worker_run_id"], "Image generation failed in the GPU worker.", int(get_runtime_setting("GPU_REQUEST_MAX_ATTEMPTS", 3)))
     return jsonify({"ok": True, "status": state or row["status"]}), 200
 
 
@@ -1111,7 +1310,7 @@ def internal_gpu_worker_exiting():
         return jsonify({"error": "Invalid elapsed time."}), 400
     if abs(time.time() - finished_at) > 900:
         return jsonify({"error": "Stale exit callback."}), 409
-    if not auth_store.gpu_callback_exiting(payload["worker_run_id"], reason, elapsed, GPU_REQUEST_MAX_ATTEMPTS):
+    if not auth_store.gpu_callback_exiting(payload["worker_run_id"], reason, elapsed, int(get_runtime_setting("GPU_REQUEST_MAX_ATTEMPTS", 3))):
         return jsonify({"error": "Stale worker run."}), 409
     gpu_dispatcher.notify()
     return jsonify({"ok": True}), 200
@@ -1194,7 +1393,7 @@ def queue_status():
                     "queue_limit": MAX_PENDING_JOBS,
                     "gpu_worker": {"state": gpu["state"], "queue_depth": gpu["queue_depth"],
                         "active_requests": gpu["active_requests"],
-                        "unavailable": gpu["unavailable_reason"] or ("Autostart is disabled." if not KAGGLE_BATCH_AUTOSTART else None)}}), 200
+                        "unavailable": gpu["unavailable_reason"] or ("Autostart is disabled." if not get_runtime_setting("KAGGLE_BATCH_AUTOSTART", False) else None)}}), 200
 
 
 @app.route("/healthz", methods=["GET"])
@@ -1209,18 +1408,18 @@ def health_check():
 def api_gpu_status():
     """Operational metrics for signed-in workspace operators."""
     gpu = auth_store.gpu_supervisor_snapshot()
-    return jsonify({"enabled": KAGGLE_BATCH_AUTOSTART, "state": gpu["state"],
+    return jsonify({"enabled": get_runtime_setting("KAGGLE_BATCH_AUTOSTART", False), "state": gpu["state"],
         "active_run": gpu["active_dispatch_id"], "last_result": gpu["last_result"],
         "last_run": gpu["last_run"], "queue_depth": gpu["queue_depth"],
         "active_requests": gpu["active_requests"], "launches_24h": gpu["launches_24h"],
         "average_request_seconds": gpu["average_request_seconds"],
         "estimated_worker_seconds": gpu["estimated_worker_seconds"],
-        "max_starts_per_day": KAGGLE_BATCH_MAX_STARTS_PER_DAY,
+        "max_starts_per_day": get_runtime_setting("KAGGLE_BATCH_MAX_STARTS_PER_DAY", 6),
         "failed_runs_7d": gpu["failed_runs_7d"],
         "runtime_7d_seconds": gpu["runtime_7d_seconds"],
-        "weekly_runtime_budget_seconds": KAGGLE_BATCH_MAX_RUNTIME_PER_WEEK_SECONDS,
-        "idle_exit_seconds": KAGGLE_BATCH_IDLE_EXIT_SECONDS,
-        "max_runtime_seconds": KAGGLE_BATCH_MAX_RUNTIME_SECONDS,
+        "weekly_runtime_budget_seconds": get_runtime_setting("KAGGLE_BATCH_MAX_RUNTIME_PER_WEEK_SECONDS", 0),
+        "idle_exit_seconds": get_runtime_setting("WORKER_IDLE_EXIT_SECONDS", 45),
+        "max_runtime_seconds": get_runtime_setting("WORKER_MAX_RUNTIME_SECONDS", 14400),
         "unavailable_reason": gpu["unavailable_reason"]}), 200
 
 

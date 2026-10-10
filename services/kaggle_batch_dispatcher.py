@@ -8,12 +8,8 @@ import time
 import uuid
 from pathlib import Path
 
-from config import (KAGGLE_API_TOKEN, KAGGLE_BATCH_ACCELERATOR, KAGGLE_BATCH_AUTOSTART,
-                    KAGGLE_BATCH_DEBOUNCE_SECONDS, KAGGLE_BATCH_IDLE_EXIT_SECONDS,
-                    KAGGLE_BATCH_MAX_RUNTIME_PER_WEEK_SECONDS, KAGGLE_BATCH_MAX_RUNTIME_SECONDS,
-                    KAGGLE_BATCH_MAX_STARTS_PER_DAY, KAGGLE_BATCH_POLL_SECONDS,
-                    KAGGLE_BATCH_TIMEOUT_SECONDS, KAGGLE_KERNEL_ID, KAGGLE_KERNEL_PATH,
-                    WORKER_CALLBACK_TOKEN)
+from config import KAGGLE_KERNEL_PATH, WORKER_CALLBACK_TOKEN
+from services.runtime_settings import get as get_runtime_setting
 
 
 class KaggleBatchDispatcher:
@@ -24,7 +20,9 @@ class KaggleBatchDispatcher:
         self.wake = threading.Event()
         self.stop = threading.Event()
 
-    def start(self, enabled=KAGGLE_BATCH_AUTOSTART):
+    def start(self, enabled=None):
+        if enabled is None:
+            enabled = get_runtime_setting("KAGGLE_BATCH_AUTOSTART", False)
         if not enabled:
             return False
         if self.thread and self.thread.is_alive():
@@ -38,13 +36,14 @@ class KaggleBatchDispatcher:
 
     def can_accept_user_jobs(self):
         """Cheap readiness gate before starting LLM/TTS work for a user job."""
-        if not KAGGLE_BATCH_AUTOSTART:
+        if not get_runtime_setting("KAGGLE_BATCH_AUTOSTART", False):
             return False
-        if (not re.fullmatch(r"[A-Za-z0-9_-]{1,60}/[A-Za-z0-9_-]{1,100}", KAGGLE_KERNEL_ID)
-                or KAGGLE_KERNEL_ID.startswith("owner/")):
+        kernel_id = str(get_runtime_setting("KAGGLE_KERNEL_ID", "")).strip()
+        if (not re.fullmatch(r"[A-Za-z0-9_-]{1,60}/[A-Za-z0-9_-]{1,100}", kernel_id)
+                or kernel_id.startswith("owner/")):
             self.store.gpu_supervisor_update(unavailable_reason="Set KAGGLE_KERNEL_ID to your actual Kaggle username/notebook-slug.")
             return False
-        if not KAGGLE_API_TOKEN:
+        if not get_runtime_setting("KAGGLE_API_TOKEN", ""):
             self.store.gpu_supervisor_update(unavailable_reason="Kaggle CLI credentials are not configured.")
             return False
         if len(WORKER_CALLBACK_TOKEN) < 32:
@@ -63,8 +62,9 @@ class KaggleBatchDispatcher:
             last_heartbeat = snapshot.get("worker_heartbeat_at")
             heartbeat_age = time.time() - float(last_heartbeat) if last_heartbeat else None
             run_age = time.time() - float(snapshot.get("started_at") or time.time())
-            stale = heartbeat_age is None and run_age > max(180, KAGGLE_BATCH_POLL_SECONDS * 4)
-            stale = stale or (heartbeat_age is not None and heartbeat_age > max(180, KAGGLE_BATCH_POLL_SECONDS * 4))
+            poll_seconds = int(get_runtime_setting("KAGGLE_BATCH_POLL_SECONDS", 60))
+            stale = heartbeat_age is None and run_age > max(180, poll_seconds * 4)
+            stale = stale or (heartbeat_age is not None and heartbeat_age > max(180, poll_seconds * 4))
             if snapshot.get("state") == "running" and stale:
                 self.store.gpu_supervisor_update(unavailable_reason="Kaggle worker heartbeat is stale; waiting for run reconciliation.")
                 return False
@@ -74,7 +74,7 @@ class KaggleBatchDispatcher:
             self.store.gpu_supervisor_update(unavailable_reason=reason)
             return False
         try:
-            result = self._cli(["kernels", "status", KAGGLE_KERNEL_ID], 20)
+            result = self._cli(["kernels", "status", kernel_id], 20)
             if result.returncode == 0:
                 status = self.parse_status((result.stdout or "") + (result.stderr or ""))
                 if status in {"RUNNING", "QUEUED", "PENDING"}:
@@ -94,8 +94,9 @@ class KaggleBatchDispatcher:
 
     def _env(self):
         env = os.environ.copy()
-        if KAGGLE_API_TOKEN:
-            env["KAGGLE_API_TOKEN"] = KAGGLE_API_TOKEN
+        api_token = str(get_runtime_setting("KAGGLE_API_TOKEN", "") or "").strip()
+        if api_token:
+            env["KAGGLE_API_TOKEN"] = api_token
         return env
 
     def _cli(self, args, timeout):
@@ -108,10 +109,9 @@ class KaggleBatchDispatcher:
         except subprocess.TimeoutExpired:
             raise RuntimeError("Kaggle CLI operation timed out.")
 
-    @staticmethod
-    def _prepare_kernel_files(metadata_path: Path, notebook_path: Path) -> None:
+    def _prepare_kernel_files(self, metadata_path: Path, notebook_path: Path) -> None:
         """Fill public deployment details from Render env before pushing the notebook."""
-        kernel_id = KAGGLE_KERNEL_ID.strip()
+        kernel_id = str(get_runtime_setting("KAGGLE_KERNEL_ID", "")).strip()
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,60}/[A-Za-z0-9_-]{1,100}", kernel_id):
             raise RuntimeError("Set KAGGLE_KERNEL_ID to your Kaggle username/notebook-slug value.")
         base_url = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
@@ -127,6 +127,7 @@ class KaggleBatchDispatcher:
             raise RuntimeError("Kaggle metadata or worker notebook is invalid.") from None
 
         metadata["id"] = kernel_id
+        metadata["machine_shape"] = str(get_runtime_setting("KAGGLE_BATCH_ACCELERATOR", "NvidiaTeslaT4"))
         source, url_replacements = re.subn(
             r'^FLASK_WORKER_BASE_URL\s*=.*$',
             f"FLASK_WORKER_BASE_URL = {json.dumps(base_url)}",
@@ -138,6 +139,16 @@ class KaggleBatchDispatcher:
         )
         if url_replacements != 1 or id_replacements != 1:
             raise RuntimeError("Worker notebook config markers could not be updated.")
+        timer_replacements = (
+            (r"^IDLE_EXIT_SECONDS\s*=.*$", f"IDLE_EXIT_SECONDS = {int(get_runtime_setting('WORKER_IDLE_EXIT_SECONDS', 45))}"),
+            (r"^MAX_RUNTIME_SECONDS\s*=.*$", f"MAX_RUNTIME_SECONDS = {int(get_runtime_setting('WORKER_MAX_RUNTIME_SECONDS', 14400))}"),
+            (r"^POLL_INTERVAL_SECONDS\s*=.*$", f"POLL_INTERVAL_SECONDS = {float(get_runtime_setting('WORKER_POLL_INTERVAL_SECONDS', 2.0))}"),
+            (r"^HTTP_TIMEOUT_SECONDS\s*=.*$", f"HTTP_TIMEOUT_SECONDS = {int(get_runtime_setting('WORKER_HTTP_TIMEOUT_SECONDS', 45))}"),
+        )
+        if any(re.search(pattern, source, flags=re.MULTILINE) is None for pattern, _ in timer_replacements):
+            raise RuntimeError("Worker notebook runtime config markers could not be updated.")
+        for pattern, replacement in timer_replacements:
+            source = re.sub(pattern, replacement, source, count=1, flags=re.MULTILINE)
         cells[3]["source"] = source.splitlines(keepends=True)
 
         for path, payload in ((metadata_path, metadata), (notebook_path, notebook)):
@@ -147,21 +158,23 @@ class KaggleBatchDispatcher:
 
     def budget_allows_start(self):
         snap = self.store.gpu_supervisor_snapshot()
-        if KAGGLE_BATCH_MAX_STARTS_PER_DAY <= 0 or snap["launches_24h"] >= KAGGLE_BATCH_MAX_STARTS_PER_DAY:
+        max_starts = int(get_runtime_setting("KAGGLE_BATCH_MAX_STARTS_PER_DAY", 6))
+        if max_starts <= 0 or snap["launches_24h"] >= max_starts:
             return False, "Daily Kaggle batch start cap reached. GPU worker unavailable until the cap window resets."
         runtime_total = snap["runtime_7d_seconds"]
         if snap.get("active_dispatch_id") and snap.get("started_at"):
             runtime_total += max(0, time.time() - float(snap["started_at"]))
-        if (KAGGLE_BATCH_MAX_RUNTIME_PER_WEEK_SECONDS and
-                runtime_total >= KAGGLE_BATCH_MAX_RUNTIME_PER_WEEK_SECONDS):
+        weekly_cap = int(get_runtime_setting("KAGGLE_BATCH_MAX_RUNTIME_PER_WEEK_SECONDS", 0))
+        if weekly_cap and runtime_total >= weekly_cap:
             return False, "Weekly Kaggle runtime budget reached. GPU worker paused."
         return True, None
 
     def launch(self):
-        if not KAGGLE_API_TOKEN:
+        if not get_runtime_setting("KAGGLE_API_TOKEN", ""):
             raise RuntimeError("Kaggle CLI credentials are not configured.")
         if len(WORKER_CALLBACK_TOKEN) < 32:
             raise RuntimeError("WORKER_CALLBACK_TOKEN must be a high-entropy secret of at least 32 characters.")
+        kernel_id = str(get_runtime_setting("KAGGLE_KERNEL_ID", "")).strip()
         meta = KAGGLE_KERNEL_PATH / "kernel-metadata.json"
         notebook = KAGGLE_KERNEL_PATH / "fluxstory_kaggle_auto_batch_worker.ipynb"
         if not meta.is_file() or not notebook.is_file():
@@ -171,7 +184,7 @@ class KaggleBatchDispatcher:
             self.store.gpu_supervisor_update(state="idle", unavailable_reason=reason, last_error_at=time.time())
             return False
         try:
-            status_result = self._cli(["kernels", "status", KAGGLE_KERNEL_ID], 30)
+            status_result = self._cli(["kernels", "status", kernel_id], 30)
         except RuntimeError as exc:
             self.store.gpu_supervisor_update(state="idle", unavailable_reason=str(exc)[:160], last_error_at=time.time())
             return False
@@ -191,13 +204,13 @@ class KaggleBatchDispatcher:
             return False
         dispatch_id = str(uuid.uuid4())
         self.store.gpu_supervisor_update(state="starting", active_dispatch_id=dispatch_id,
-                                         worker_run_id=None, kernel_id=KAGGLE_KERNEL_ID,
+                                         worker_run_id=None, kernel_id=kernel_id,
                                          started_at=time.time(), unavailable_reason=None)
         self.store.gpu_run_update(dispatch_id, "starting")
         try:
             result = self._cli(["kernels", "push", "-p", str(KAGGLE_KERNEL_PATH),
-                                "--timeout", str(KAGGLE_BATCH_TIMEOUT_SECONDS),
-                                "--accelerator", KAGGLE_BATCH_ACCELERATOR], 180)
+                                "--timeout", str(get_runtime_setting("KAGGLE_BATCH_TIMEOUT_SECONDS", 14400)),
+                                "--accelerator", str(get_runtime_setting("KAGGLE_BATCH_ACCELERATOR", "NvidiaTeslaT4"))], 180)
         except RuntimeError as exc:
             self.store.gpu_run_update(dispatch_id, "failed", finished_at=time.time(), result="Kaggle CLI launch unavailable")
             self.store.gpu_supervisor_update(state="failed", active_dispatch_id=None,
@@ -221,7 +234,7 @@ class KaggleBatchDispatcher:
         return "UNKNOWN"
 
     def poll(self):
-        result = self._cli(["kernels", "status", KAGGLE_KERNEL_ID], 30)
+        result = self._cli(["kernels", "status", str(get_runtime_setting("KAGGLE_KERNEL_ID", ""))], 30)
         snapshot = self.store.gpu_supervisor_snapshot()
         dispatch_id = snapshot.get("active_dispatch_id")
         if result.returncode != 0:
@@ -251,7 +264,7 @@ class KaggleBatchDispatcher:
             self.store.gpu_supervisor_update(state="failed", active_dispatch_id=None, worker_run_id=None,
                 last_result="failed", unavailable_reason="Kaggle batch failed; recoverable requests remain queued.", last_error_at=now)
         elif state in {"RUNNING", "QUEUED", "PENDING"}:
-            timed_out = snapshot.get("started_at") and now - float(snapshot["started_at"]) > KAGGLE_BATCH_MAX_RUNTIME_SECONDS + 300
+            timed_out = snapshot.get("started_at") and now - float(snapshot["started_at"]) > int(get_runtime_setting("KAGGLE_BATCH_MAX_RUNTIME_SECONDS", 14400)) + 300
             reason = "Kaggle batch exceeded its configured runtime; stop it in Kaggle UI." if timed_out else None
             self.store.gpu_supervisor_update(state="exiting" if snapshot.get("state") == "exiting" else "running", unavailable_reason=reason)
         else:
@@ -264,6 +277,8 @@ class KaggleBatchDispatcher:
             return
         snap = self.store.gpu_supervisor_snapshot()
         self.store.gpu_supervisor_update(heartbeat_at=time.time())
+        if not get_runtime_setting("KAGGLE_BATCH_AUTOSTART", False):
+            return
         if snap.get("active_dispatch_id"):
             try:
                 self.poll()
@@ -273,7 +288,7 @@ class KaggleBatchDispatcher:
         if not snap["queue_depth"]:
             return
         self.wake.clear()
-        self.stop.wait(KAGGLE_BATCH_DEBOUNCE_SECONDS)
+        self.stop.wait(float(get_runtime_setting("KAGGLE_BATCH_DEBOUNCE_SECONDS", 10)))
         if not self.store.gpu_queue_depth():
             return
         try:
@@ -286,7 +301,7 @@ class KaggleBatchDispatcher:
         while not self.stop.is_set():
             try:
                 self.run_once()
-                backoff = KAGGLE_BATCH_POLL_SECONDS
+                backoff = int(get_runtime_setting("KAGGLE_BATCH_POLL_SECONDS", 60))
             except Exception:
                 # No exception text is logged because it could contain secrets.
                 backoff = min(300, max(5, backoff * 2))

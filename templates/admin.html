@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block title %}Admin settings — AuraFLUX Studio{% endblock %}
+{% block breadcrumb %}Workspace administration{% endblock %}
+{% block content %}
+<section class="admin-page">
+    <div class="page-heading admin-heading">
+        <div><p class="eyebrow">WORKSPACE CONTROL</p><h1>Admin settings</h1><p>Manage how AuraFLUX writes, renders, and connects to its GPU worker.</p></div>
+        <span class="admin-secure-label"><i class="fa-solid fa-shield-halved" aria-hidden="true"></i> Admin access</span>
+    </div>
+
+    <div class="admin-metrics" aria-label="Workspace overview">
+        <div><span>Accounts</span><strong>{{ overview.users }}</strong></div>
+        <div><span>Waiting jobs</span><strong>{{ overview.queued_jobs }}</strong></div>
+        <div><span>Running jobs</span><strong>{{ overview.processing_jobs }}</strong></div>
+        <div><span>GPU worker</span><strong class="admin-state admin-state-{{ gpu.state|lower }}">{{ gpu.state|title }}</strong></div>
+    </div>
+    {% if gpu.unavailable_reason %}<p class="admin-notice"><i class="fa-solid fa-circle-info" aria-hidden="true"></i> {{ gpu.unavailable_reason }}</p>{% endif %}
+    {% if error %}<p class="auth-error" role="alert">{{ error }}</p>{% endif %}
+    {% if success %}<p class="admin-success" role="status"><i class="fa-solid fa-circle-check" aria-hidden="true"></i> {{ success }}</p>{% endif %}
+
+    <nav class="admin-tabs" aria-label="Settings sections">
+        {% for key, group in groups.items() %}<a href="{{ url_for('admin_panel', section=key) }}" {% if section == key %}aria-current="page"{% endif %}>{{ group.title }}</a>{% endfor %}
+    </nav>
+
+    {% if section == 'ai' %}
+    <form class="admin-card" method="post" action="{{ url_for('admin_panel', section='ai') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <div class="admin-card-heading"><div><h2>AI writing and narration</h2><p>Choose the AI used to plan scenes and the voice used for narration.</p></div><span>Values from {{ sources.LLM_PROVIDER }}</span></div>
+        <div class="admin-form-grid">
+            <div class="admin-field"><label for="LLM_PROVIDER">Main AI provider</label><select id="LLM_PROVIDER" name="LLM_PROVIDER"><option value="openai" {% if values.LLM_PROVIDER == 'openai' %}selected{% endif %}>OpenAI</option><option value="gemini" {% if values.LLM_PROVIDER == 'gemini' %}selected{% endif %}>Google Gemini</option><option value="groq" {% if values.LLM_PROVIDER == 'groq' %}selected{% endif %}>Groq</option><option value="custom" {% if values.LLM_PROVIDER == 'custom' %}selected{% endif %}>Custom OpenAI-compatible service</option></select><small>The app tries this provider first.</small></div>
+            <div class="admin-field"><label for="DEFAULT_LLM_MODEL">Model name</label><input id="DEFAULT_LLM_MODEL" name="DEFAULT_LLM_MODEL" value="{{ values.DEFAULT_LLM_MODEL }}" maxlength="160" required><small>Use a model name supported by your selected provider.</small></div>
+            <div class="admin-field admin-field-wide"><label for="LLM_FALLBACKS">Backup AI providers (optional)</label><textarea id="LLM_FALLBACKS" name="LLM_FALLBACKS" rows="2" placeholder="groq:llama-3.3-70b-versatile, openai:gpt-4o-mini">{{ values.LLM_FALLBACKS }}</textarea><small>Ordered provider:model pairs, separated by commas. Example: groq:model-name, openai:gpt-4o-mini.</small></div>
+            <div class="admin-field"><label for="CUSTOM_LLM_BASE_URL">Custom provider URL</label><input id="CUSTOM_LLM_BASE_URL" name="CUSTOM_LLM_BASE_URL" type="url" value="{{ values.CUSTOM_LLM_BASE_URL }}" placeholder="https://api.example.com/v1"><small>Used only when Custom is selected.</small></div>
+            <div class="admin-field"><label for="DEFAULT_TTS_VOICE">Narration voice</label><select id="DEFAULT_TTS_VOICE" name="DEFAULT_TTS_VOICE">{% for voice in voices %}<option value="{{ voice.id }}" {% if values.DEFAULT_TTS_VOICE == voice.id %}selected{% endif %}>{{ voice.name }}</option>{% endfor %}</select></div>
+        </div>
+        <h3 class="admin-subheading">Provider keys</h3><p class="admin-help">Keys are encrypted before they are saved. The saved value is never displayed. Leave a box empty to keep its current key.</p>
+        <div class="admin-form-grid">
+            {% for key, label in [('OPENAI_API_KEY','OpenAI API key'),('GEMINI_API_KEY','Google Gemini API key'),('GROQ_API_KEY','Groq API key'),('CUSTOM_LLM_API_KEY','Custom provider API key'),('DEEPGRAM_API_KEY','Deepgram narration key')] %}
+            <div class="admin-field"><label for="{{ key }}">{{ label }}</label><input id="{{ key }}" name="{{ key }}" type="password" autocomplete="new-password" placeholder="{% if secret_states[key] %}Saved; leave blank to keep it{% else %}Not set{% endif %}"><small>{% if secret_states[key] %}A key is configured.{% else %}No key configured.{% endif %} <label class="admin-check"><input type="checkbox" name="clear_secret" value="{{ key }}"> Remove saved override</label></small></div>
+            {% endfor %}
+        </div>
+        <div class="admin-actions"><button class="button-primary" type="submit">Save AI settings</button><button class="button-secondary" type="submit" name="action" value="reset" formnovalidate>Restore environment values</button></div>
+    </form>
+
+    {% elif section == 'video' %}
+    <form class="admin-card" method="post" action="{{ url_for('admin_panel', section='video') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <div class="admin-card-heading"><div><h2>Video look and timing</h2><p>Set defaults used for newly generated videos.</p></div><span>Values from {{ sources.DEFAULT_FPS }}</span></div>
+        <div class="admin-form-grid">
+            <div class="admin-field"><label for="DEFAULT_FPS">Frames per second</label><input id="DEFAULT_FPS" name="DEFAULT_FPS" type="number" min="12" max="60" step="1" value="{{ values.DEFAULT_FPS }}" required><small>Higher values make motion smoother and increase render time. Allowed: 12–60.</small></div>
+            <div class="admin-field"><label for="CROSSFADE_BUFFER">Scene transition overlap (seconds)</label><input id="CROSSFADE_BUFFER" name="CROSSFADE_BUFFER" type="number" min="0" max="5" step="0.1" value="{{ values.CROSSFADE_BUFFER }}" required><small>How long neighboring scenes blend together. Set 0 for a cut.</small></div>
+            <div class="admin-field"><label for="TARGET_SCENE_DURATION_SEC">Target scene length (seconds)</label><input id="TARGET_SCENE_DURATION_SEC" name="TARGET_SCENE_DURATION_SEC" type="number" min="4" max="12" step="0.5" value="{{ values.TARGET_SCENE_DURATION_SEC }}" required><small>Guides the scene planner; actual length follows the narration.</small></div>
+        </div>
+        <div class="admin-actions"><button class="button-primary" type="submit">Save video settings</button><button class="button-secondary" type="submit" name="action" value="reset" formnovalidate>Restore environment values</button></div>
+    </form>
+
+    {% elif section == 'worker' %}
+    <form class="admin-card" method="post" action="{{ url_for('admin_panel', section='worker') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <div class="admin-card-heading"><div><h2>Kaggle GPU worker</h2><p>Control automatic launches and the worker notebook’s run limits.</p></div><span>Values from {{ sources.KAGGLE_KERNEL_ID }}</span></div>
+        <div class="admin-callout"><strong>Before turning on automatic launches</strong><span>Set the Kaggle API token, notebook ID, callback token and private worker dataset in Render and Kaggle. The callback token stays in Render and the private Kaggle dataset so both sides keep matching.</span></div>
+        <div class="admin-form-grid">
+            <div class="admin-field admin-field-wide"><label class="admin-check admin-toggle"><input type="checkbox" name="KAGGLE_BATCH_AUTOSTART" value="true" {% if values.KAGGLE_BATCH_AUTOSTART %}checked{% endif %}> Start Kaggle automatically when GPU work is waiting</label><small>Turn this on only after the connection details above are ready.</small></div>
+            <div class="admin-field"><label for="KAGGLE_KERNEL_ID">Kaggle notebook ID</label><input id="KAGGLE_KERNEL_ID" name="KAGGLE_KERNEL_ID" value="{{ values.KAGGLE_KERNEL_ID }}" placeholder="username/notebook-slug" required><small>Find it in the notebook URL after kaggle.com/code/.</small></div>
+            <div class="admin-field"><label for="KAGGLE_BATCH_ACCELERATOR">GPU type</label><input id="KAGGLE_BATCH_ACCELERATOR" name="KAGGLE_BATCH_ACCELERATOR" value="{{ values.KAGGLE_BATCH_ACCELERATOR }}" placeholder="NvidiaTeslaT4" required><small>Use an accelerator name supported by Kaggle, for example NvidiaTeslaT4.</small></div>
+            <div class="admin-field"><label for="KAGGLE_API_TOKEN">Kaggle API token</label><input id="KAGGLE_API_TOKEN" name="KAGGLE_API_TOKEN" type="password" autocomplete="new-password" placeholder="{% if secret_states.KAGGLE_API_TOKEN %}Saved; leave blank to keep it{% else %}Not set{% endif %}"><small>{% if secret_states.KAGGLE_API_TOKEN %}A token is configured.{% else %}No token configured.{% endif %} <label class="admin-check"><input type="checkbox" name="clear_secret" value="KAGGLE_API_TOKEN"> Remove saved override</label></small></div>
+            <div class="admin-field"><label for="KAGGLE_BATCH_TIMEOUT_SECONDS">Maximum Kaggle run time (seconds)</label><input id="KAGGLE_BATCH_TIMEOUT_SECONDS" name="KAGGLE_BATCH_TIMEOUT_SECONDS" type="number" min="300" max="14400" value="{{ values.KAGGLE_BATCH_TIMEOUT_SECONDS }}" required><small>Upper bound passed when the notebook run starts. Maximum 4 hours.</small></div>
+            <div class="admin-field"><label for="KAGGLE_BATCH_DEBOUNCE_SECONDS">Wait before starting (seconds)</label><input id="KAGGLE_BATCH_DEBOUNCE_SECONDS" name="KAGGLE_BATCH_DEBOUNCE_SECONDS" type="number" min="0" max="120" step="1" value="{{ values.KAGGLE_BATCH_DEBOUNCE_SECONDS }}" required><small>Combines nearby requests into one GPU run.</small></div>
+            <div class="admin-field"><label for="KAGGLE_BATCH_IDLE_EXIT_SECONDS">Dispatcher idle limit (seconds)</label><input id="KAGGLE_BATCH_IDLE_EXIT_SECONDS" name="KAGGLE_BATCH_IDLE_EXIT_SECONDS" type="number" min="10" max="600" value="{{ values.KAGGLE_BATCH_IDLE_EXIT_SECONDS }}" required><small>Status/watchdog value. It does not set the notebook timer.</small></div>
+            <div class="admin-field"><label for="KAGGLE_BATCH_MAX_RUNTIME_SECONDS">Dispatcher runtime limit (seconds)</label><input id="KAGGLE_BATCH_MAX_RUNTIME_SECONDS" name="KAGGLE_BATCH_MAX_RUNTIME_SECONDS" type="number" min="300" max="14400" value="{{ values.KAGGLE_BATCH_MAX_RUNTIME_SECONDS }}" required><small>Used to detect an overlong run; it does not set the notebook timer.</small></div>
+            <div class="admin-field"><label for="WORKER_IDLE_EXIT_SECONDS">Notebook idle exit (seconds)</label><input id="WORKER_IDLE_EXIT_SECONDS" name="WORKER_IDLE_EXIT_SECONDS" type="number" min="10" max="600" value="{{ values.WORKER_IDLE_EXIT_SECONDS }}" required><small>The notebook exits after this long with an empty queue.</small></div>
+            <div class="admin-field"><label for="WORKER_MAX_RUNTIME_SECONDS">Notebook maximum runtime (seconds)</label><input id="WORKER_MAX_RUNTIME_SECONDS" name="WORKER_MAX_RUNTIME_SECONDS" type="number" min="300" max="14400" value="{{ values.WORKER_MAX_RUNTIME_SECONDS }}" required><small>Injected into the notebook at the next Kaggle push.</small></div>
+            <div class="admin-field"><label for="WORKER_POLL_INTERVAL_SECONDS">Notebook queue check interval (seconds)</label><input id="WORKER_POLL_INTERVAL_SECONDS" name="WORKER_POLL_INTERVAL_SECONDS" type="number" min="0.5" max="30" step="0.5" value="{{ values.WORKER_POLL_INTERVAL_SECONDS }}" required></div>
+            <div class="admin-field"><label for="WORKER_HTTP_TIMEOUT_SECONDS">Notebook request timeout (seconds)</label><input id="WORKER_HTTP_TIMEOUT_SECONDS" name="WORKER_HTTP_TIMEOUT_SECONDS" type="number" min="10" max="180" value="{{ values.WORKER_HTTP_TIMEOUT_SECONDS }}" required></div>
+            <div class="admin-field"><label for="KAGGLE_BATCH_MAX_STARTS_PER_DAY">Maximum Kaggle starts per day</label><input id="KAGGLE_BATCH_MAX_STARTS_PER_DAY" name="KAGGLE_BATCH_MAX_STARTS_PER_DAY" type="number" min="0" max="100" value="{{ values.KAGGLE_BATCH_MAX_STARTS_PER_DAY }}" required><small>0 pauses new starts.</small></div>
+            <div class="admin-field"><label for="KAGGLE_BATCH_MAX_RUNTIME_PER_WEEK_SECONDS">Weekly runtime limit (seconds)</label><input id="KAGGLE_BATCH_MAX_RUNTIME_PER_WEEK_SECONDS" name="KAGGLE_BATCH_MAX_RUNTIME_PER_WEEK_SECONDS" type="number" min="0" max="604800" value="{{ values.KAGGLE_BATCH_MAX_RUNTIME_PER_WEEK_SECONDS }}" required><small>0 means no weekly cap.</small></div>
+            <div class="admin-field"><label for="KAGGLE_BATCH_POLL_SECONDS">Dispatcher check interval (seconds)</label><input id="KAGGLE_BATCH_POLL_SECONDS" name="KAGGLE_BATCH_POLL_SECONDS" type="number" min="15" max="300" value="{{ values.KAGGLE_BATCH_POLL_SECONDS }}" required><small>How often Render checks Kaggle run status.</small></div>
+        </div>
+        <div class="admin-actions"><button class="button-primary" type="submit">Save worker settings</button><button class="button-secondary" type="submit" name="action" value="reset" formnovalidate>Restore environment values</button></div>
+    </form>
+
+    {% else %}
+    <form class="admin-card" method="post" action="{{ url_for('admin_panel', section='queue') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <div class="admin-card-heading"><div><h2>GPU request queue</h2><p>Set how much work can wait and how interrupted requests recover.</p></div><span>Values from {{ sources.GPU_REQUEST_MAX_PENDING }}</span></div>
+        <div class="admin-form-grid">
+            <div class="admin-field"><label for="GPU_REQUEST_MAX_PENDING">Maximum waiting image requests</label><input id="GPU_REQUEST_MAX_PENDING" name="GPU_REQUEST_MAX_PENDING" type="number" min="1" max="1000" value="{{ values.GPU_REQUEST_MAX_PENDING }}" required><small>Requests beyond this limit wait to be accepted until space opens.</small></div>
+            <div class="admin-field"><label for="GPU_REQUEST_LEASE_SECONDS">Request recovery time (seconds)</label><input id="GPU_REQUEST_LEASE_SECONDS" name="GPU_REQUEST_LEASE_SECONDS" type="number" min="60" max="3600" value="{{ values.GPU_REQUEST_LEASE_SECONDS }}" required><small>If a worker stops responding, its request can be returned to the queue after this time.</small></div>
+            <div class="admin-field"><label for="GPU_REQUEST_MAX_ATTEMPTS">Retry attempts</label><input id="GPU_REQUEST_MAX_ATTEMPTS" name="GPU_REQUEST_MAX_ATTEMPTS" type="number" min="1" max="5" value="{{ values.GPU_REQUEST_MAX_ATTEMPTS }}" required><small>After this many failed attempts, the request is marked failed.</small></div>
+        </div>
+        <div class="admin-actions"><button class="button-primary" type="submit">Save queue settings</button><button class="button-secondary" type="submit" name="action" value="reset" formnovalidate>Restore environment values</button></div>
+    </form>
+    {% endif %}
+    <p class="admin-footnote">Setting changes are saved in the workspace database and take effect without a redeploy. “Restore environment values” removes the saved overrides for this section.</p>
+</section>
+{% endblock %}

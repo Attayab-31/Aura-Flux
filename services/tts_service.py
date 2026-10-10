@@ -15,7 +15,7 @@ from typing import Optional
 import requests
 from mutagen.mp3 import MP3
 
-from config import DEEPGRAM_API_KEY, DEFAULT_TTS_VOICE
+from services.runtime_settings import get as get_runtime_setting
 
 logger = logging.getLogger(__name__)
 
@@ -88,12 +88,12 @@ def generate_speech(
     out_file = Path(output_path)
     out_file.parent.mkdir(parents=True, exist_ok=True)
 
-    effective_key = (api_key or DEEPGRAM_API_KEY or "").strip()
+    effective_key = (api_key or get_runtime_setting("DEEPGRAM_API_KEY", "") or "").strip()
 
     if not effective_key:
         raise RuntimeError("DEEPGRAM_API_KEY is required for speech generation.")
 
-    url = f"https://api.deepgram.com/v1/speak?model={model or DEFAULT_TTS_VOICE}"
+    url = f"https://api.deepgram.com/v1/speak?model={model or get_runtime_setting('DEFAULT_TTS_VOICE', 'aura-2-thalia-en')}"
     headers = {
         "Authorization": f"Token {effective_key}",
         "Content-Type": "application/json"

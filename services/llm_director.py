@@ -13,7 +13,8 @@ import logging
 import re
 from typing import List, Dict, Any, Optional
 
-from config import LLM_PROVIDER_SETTINGS, LLM_PROVIDER, DEFAULT_LLM_MODEL, LLM_FALLBACKS, STYLE_PRESETS, TARGET_SCENE_DURATION_SEC
+from config import STYLE_PRESETS
+from services.runtime_settings import get as get_runtime_setting
 
 logger = logging.getLogger(__name__)
 
@@ -163,7 +164,7 @@ def plan_narrative(
     story_text: str,
     duration_minutes: float,
     api_key: Optional[str] = None,
-    model: str = DEFAULT_LLM_MODEL,
+    model: Optional[str] = None,
     style_preset: Optional[str] = "cinematic",
     provider: Optional[str] = None,
     target_scene_count: Optional[int] = None
@@ -186,7 +187,8 @@ def plan_narrative(
         raise ValueError("Story text cannot be empty.")
 
     total_seconds = max(15.0, float(duration_minutes) * 60.0)
-    target_scene_count = target_scene_count or min(60, max(2, int(round(total_seconds / TARGET_SCENE_DURATION_SEC))))
+    target_scene_seconds = float(get_runtime_setting("TARGET_SCENE_DURATION_SEC", 7.0))
+    target_scene_count = target_scene_count or min(60, max(2, int(round(total_seconds / target_scene_seconds))))
     if target_scene_count < 2 or target_scene_count > 60:
         raise ValueError("Image count must be between 2 and 60.")
     target_scene_duration = total_seconds / target_scene_count
@@ -195,9 +197,9 @@ def plan_narrative(
     preset_data = STYLE_PRESETS.get(style_preset or "cinematic", STYLE_PRESETS["cinematic"])
     style_anchor = preset_data["prompt_anchor"]
 
-    selected_provider = (provider or LLM_PROVIDER).lower()
-    attempts = [(selected_provider, model or DEFAULT_LLM_MODEL)]
-    for entry in LLM_FALLBACKS.split(","):
+    selected_provider = (provider or get_runtime_setting("LLM_PROVIDER", "openai")).lower()
+    attempts = [(selected_provider, model or get_runtime_setting("DEFAULT_LLM_MODEL", "gpt-4o-mini"))]
+    for entry in str(get_runtime_setting("LLM_FALLBACKS", "") or "").replace("\n", ",").split(","):
         provider_name, separator, fallback_model = entry.strip().partition(":")
         if separator and provider_name.strip() and fallback_model.strip():
             attempts.append((provider_name.strip().lower(), fallback_model.strip()))
@@ -211,8 +213,14 @@ def plan_narrative(
         f"Generate exactly {target_scene_count} scenes following the system instructions."
     )
 
+    provider_settings = {
+        "openai": {"api_key": get_runtime_setting("OPENAI_API_KEY", ""), "base_url": ""},
+        "gemini": {"api_key": get_runtime_setting("GEMINI_API_KEY", ""), "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/"},
+        "groq": {"api_key": get_runtime_setting("GROQ_API_KEY", ""), "base_url": "https://api.groq.com/openai/v1"},
+        "custom": {"api_key": get_runtime_setting("CUSTOM_LLM_API_KEY", ""), "base_url": get_runtime_setting("CUSTOM_LLM_BASE_URL", "")},
+    }
     for index, (attempt_provider, attempt_model) in enumerate(attempts):
-        provider_config = LLM_PROVIDER_SETTINGS.get(attempt_provider)
+        provider_config = provider_settings.get(attempt_provider)
         if provider_config is None:
             logger.warning("Skipping unknown LLM provider '%s'.", attempt_provider)
             continue

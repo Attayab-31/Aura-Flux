@@ -23,7 +23,8 @@ from moviepy import ImageClip, AudioFileClip, CompositeVideoClip
 from moviepy.video.fx import CrossFadeIn, FadeIn, FadeOut
 from moviepy.audio.AudioClip import CompositeAudioClip
 
-from config import DEFAULT_FPS, CROSSFADE_BUFFER
+from config import DEFAULT_FPS
+from services.runtime_settings import get as get_runtime_setting
 
 logger = logging.getLogger(__name__)
 
@@ -167,7 +168,7 @@ def assemble_video(
     scene_manifest: List[Dict],
     output_filename: str | Path,
     resolution: Tuple[int, int] = (1024, 576),
-    fps: int = DEFAULT_FPS,
+    fps: Optional[int] = None,
     progress_callback: Optional[Callable[[float, str], None]] = None
 ) -> str:
     """
@@ -191,6 +192,9 @@ def assemble_video(
     """
     if not scene_manifest:
         raise ValueError("Scene manifest is empty; cannot assemble video.")
+
+    fps = int(fps or get_runtime_setting("DEFAULT_FPS", DEFAULT_FPS))
+    crossfade_buffer = float(get_runtime_setting("CROSSFADE_BUFFER", 1.0))
 
     out_path = Path(output_filename).resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -224,7 +228,7 @@ def assemble_video(
             is_last = (idx == num_scenes - 1)
             delta_t = 0.0
             if not is_last and trans_type == "crossfade":
-                delta_t = min(CROSSFADE_BUFFER, max(0.4, audio_duration * 0.2))
+                delta_t = min(crossfade_buffer, max(0.0, audio_duration * 0.2))
 
             # Display duration = audio duration + crossfade buffer
             clip_duration = audio_duration + delta_t
@@ -252,8 +256,9 @@ def assemble_video(
             if idx > 0:
                 prev_trans = scene_manifest[idx - 1].get("transition_type", "crossfade")
                 if prev_trans == "crossfade":
-                    prev_delta = min(CROSSFADE_BUFFER, max(0.4, float(scene_manifest[idx - 1].get("audio_duration", 5.0)) * 0.2))
-                    v_clip = v_clip.with_effects([CrossFadeIn(prev_delta)])
+                    prev_delta = min(crossfade_buffer, max(0.0, float(scene_manifest[idx - 1].get("audio_duration", 5.0)) * 0.2))
+                    if prev_delta > 0:
+                        v_clip = v_clip.with_effects([CrossFadeIn(prev_delta)])
                 elif prev_trans == "fade_black":
                     v_clip = v_clip.with_effects([FadeIn(0.5)])
 
